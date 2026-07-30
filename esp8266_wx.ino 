@@ -1,0 +1,796 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <SoftwareSerial.h>
+#include <time.h>
+#include <math.h>
+#include "secrets.h"
+
+// =====================================================
+// PUBLIC CONFIG
+// =====================================================
+
+const char* DEVICE_HOSTNAME = "sq4lol-wx";
+const char* MDNS_NAME       = "sq4lol-wx";
+const char* FW_VERSION      = "ESP8266WX 2.3-github";
+
+// --- APRS public ---
+const char* APRS_HOST    = "poland.aprs2.net";
+const uint16_t APRS_PORT = 14580;
+const char* APRS_CALL_WX = "SQ4LOL-15";
+const char* APRS_CALL_RS = "SQ4LOL-12";
+const char* APRS_VERS    = "ESP8266WX 2.3";
+const char* APRS_DEST    = "APRS";
+
+// --- NTP ---
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
+
+// --- Public service config ---
+const bool ENABLE_THINGSPEAK_1 = true;
+const bool ENABLE_THINGSPEAK_2 = true;
+const char* THINGSPEAK_HOST = "api.thingspeak.com";
+
+const bool ENABLE_WINDY = true;
+const char* WINDY_HOST = "stations.windy.com";
+const char* WINDY_STATION = "1";
+
+// --- Lokalizacja ---
+const char* LAT_WX = "5244.46N";
+const char* LON_WX = "02333.50E";
+const char* LAT_RS = "5244.44N";
+const char* LON_RS = "02333.50E";
+
+// --- Piny ---
+const uint8_t SDS_RX_PIN = D6;
+const uint8_t SDS_TX_PIN = D7;
+const uint8_t I2C_SDA_PIN = D2;
+const uint8_t I2C_SCL_PIN = D1;
+
+// --- Interwały ---
+const unsigned long SENSOR_PRINT_MS = 10000UL;
+const unsigned long SENSOR_CACHE_MS = 5000UL;
+const unsigned long TELEMETRY_MS    = 600000UL;
+const unsigned long WEATHER_MS      = 600000UL;
+const unsigned long META_MS         = 21600000UL;
+const unsigned long RS_MS           = 1800000UL;
+const unsigned long WIFI_CHECK_MS   = 15000UL;
+const unsigned long THINGSPEAK_MS   = 600000UL;
+const unsigned long WINDY_MS        = 600000UL;
+
+// --- SDS011 ---
+const unsigned long SDS_CYCLE_MS    = 600000UL;
+const unsigned long SDS_WARMUP_MS   = 35000UL;
+const unsigned long SDS_SAMPLE_MS   = 5000UL;
+
+// =====================================================
+// OBIEKTY I STAN
+// =====================================================
+Adafruit_BME280 bme;
+SoftwareSerial sdsSerial(SDS_RX_PIN, SDS_TX_PIN);
+WiFiClient aprsClient;
+ESP8266WebServer server(80);
+
+float pm25 = NAN;
+float pm10 = NAN;
+float lastTempC = NAN;
+float lastHum = NAN;
+float lastPressHpa = NAN;
+
+uint16_t telemSeq = 1;
+
+bool bmeOk = false;
+bool sdsAwake = false;
+bool sdsWaitingForSample = false;
+bool sdsFreshData = false;
+bool timeSynced = false;
+bool debugEnabled = false;
+bool mdnsStarted = false;
+bool aprsLoggedIn = false;
+
+unsigned long sdsWakeTime = 0;
+unsigned long lastSdsCycle = 0;
+unsigned long lastSensorPrint = 0;
+unsigned long lastSensorCache = 0;
+unsigned long lastTelemetry   = 0;
+unsigned long lastWeather     = 0;
+unsigned long lastMeta        = 0;
+unsigned long lastRS          = 0;
+unsigned long lastWiFiCheck   = 0;
+unsigned long lastThingSpeak  = 0;
+unsigned long lastWindy       = 0;
+
+// =====================================================
+// DEBUG
+// =====================================================
+#define DBG_PRINT(x)     do { if (debugEnabled) Serial.print(x); } while (0)
+#define DBG_PRINTLN(x)   do { if (debugEnabled) Serial.println(x); } while (0)
+#define DBG_PRINTF(...)  do { if (debugEnabled) Serial.printf(__VA_ARGS__); } while (0)
+
+// =====================================================
+// HELPERS
+// =====================================================
+String boolText(bool v) {
+  return v ? "true" : "false";
+}
+
+String fmtFloatOrNull(float v, int prec = 1) {
+  if (isnan(v)) return "null";
+  return String(v, prec);
+}
+
+String fmtIp() {
+  if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+  return String("0.0.0.0");
+}
+
+String uptimeString() {
+  unsigned long s = millis() / 1000UL;
+  unsigned long d = s / 86400UL;
+  s %= 86400UL;
+  unsigned long h = s / 3600UL;
+  s %= 3600UL;
+  unsigned long m = s / 60UL;
+  s %= 60UL;
+
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%lud %02luh %02lum %02lus", d, h, m, s);
+  return String(buf);
+}
+
+bool validPressure(float p) {
+  return !isnan(p) && p >= 850.0f && p <= 1100.0f;
+}
+
+bool validTemp(float t) {
+  return !isnan(t) && t > -40.0f && t < 85.0f;
+}
+
+bool validHumidity(float h) {
+  return !isnan(h) && h >= 0.0f && h <= 100.0f;
+}
+
+void updateBmeCache() {
+  if (!bmeOk) {
+    lastTempC = NAN;
+    lastHum = NAN;
+    lastPressHpa = NAN;
+    return;
+  }
+
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 100.0f;
+
+  if (validTemp(t)) lastTempC = t;
+  if (validHumidity(h)) lastHum = h;
+  if (validPressure(p)) lastPressHpa = p;
+}
+
+void updateSensorsIfNeeded() {
+  if (lastSensorCache == 0 || millis() - lastSensorCache >= SENSOR_CACHE_MS) {
+    lastSensorCache = millis();
+    updateBmeCache();
+  }
+}
+
+// =====================================================
+// TIME
+// =====================================================
+void initTime() {
+  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+  DBG_PRINTLN("[NTP] configTime started");
+}
+
+bool updateTimeStatus() {
+  time_t now = time(nullptr);
+  timeSynced = (now > 1600000000);
+  return timeSynced;
+}
+
+String aprsZuluTimestamp() {
+  time_t now = time(nullptr);
+  struct tm tmUtc;
+  gmtime_r(&now, &tmUtc);
+
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d%02d%02dz",
+           tmUtc.tm_mday, tmUtc.tm_hour, tmUtc.tm_min);
+  return String(buf);
+}
+
+String isoUtcNow() {
+  if (!timeSynced) return String("unsynced");
+  time_t now = time(nullptr);
+  struct tm tmUtc;
+  gmtime_r(&now, &tmUtc);
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+           tmUtc.tm_year + 1900, tmUtc.tm_mon + 1, tmUtc.tm_mday,
+           tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
+  return String(buf);
+}
+
+// =====================================================
+// APRS
+// =====================================================
+String aprsLoginLine() {
+  return String("user ") + APRS_CALL_WX + " pass " + APRS_PASS + " vers " + APRS_VERS;
+}
+
+String padAddressee9(const String &call) {
+  String s = call;
+  while (s.length() < 9) s += " ";
+  if (s.length() > 9) s = s.substring(0, 9);
+  return s;
+}
+
+String telemetryMessagePacket(const char* fromCall, const char* toCall, const String &payload) {
+  return String(fromCall) + ">" + APRS_DEST + ",TCPIP*::" + padAddressee9(String(toCall)) + ":" + payload;
+}
+
+String aprsParmLine() {
+  return telemetryMessagePacket(APRS_CALL_WX, APRS_CALL_WX, "PARM.PM2.5,PM10,,,,,,,");
+}
+
+String aprsUnitLine() {
+  return telemetryMessagePacket(APRS_CALL_WX, APRS_CALL_WX, "UNIT.ug/m3,ug/m3,,,,,,,");
+}
+
+String aprsEqnsLine() {
+  return telemetryMessagePacket(APRS_CALL_WX, APRS_CALL_WX, "EQNS.0,1,0,0,1,0,0,0,0,0,0,0,0,0,0");
+}
+
+String aprsBitsLine() {
+  return telemetryMessagePacket(APRS_CALL_WX, APRS_CALL_WX, "BITS.10110101,Air Pollution");
+}
+
+String aprsTelemetryLine(int seq, int pm25v, int pm10v) {
+  int a1 = constrain(pm25v, 0, 255);
+  int a2 = constrain(pm10v, 0, 255);
+
+  char line[160];
+  snprintf(line, sizeof(line),
+           "%s>%s,TCPIP*:T#%03d,%03d,%03d,000,000,000,00000000",
+           APRS_CALL_WX, APRS_DEST, seq % 1000, a1, a2);
+  return String(line);
+}
+
+String aprsWeatherLine(float tempC, float hum, float pressHpa) {
+  int tempF = (int)round(tempC * 9.0 / 5.0 + 32.0);
+
+  int humInt = (int)round(hum);
+  if (humInt < 0) humInt = 0;
+  if (humInt > 100) humInt = 100;
+  if (humInt == 100) humInt = 0;
+
+  int pressTenths = (int)round(pressHpa * 10.0);
+  String ts = aprsZuluTimestamp();
+
+  char line[240];
+  snprintf(line, sizeof(line),
+           "%s>%s,TCPIP*:@%s%s/%s_.../...g...t%03dr...p...P...h%02db%05d BME280 + SDS011",
+           APRS_CALL_WX, APRS_DEST, ts.c_str(), LAT_WX, LON_WX, tempF, humInt, pressTenths);
+  return String(line);
+}
+
+String aprsRadiosondeLine() {
+  char line[220];
+  snprintf(line, sizeof(line),
+           "%s>%s,TCPIP*:=%s/%s` Radiosonde Tracker / Bramka dla radiosond meteo",
+           APRS_CALL_RS, APRS_DEST, LAT_RS, LON_RS);
+  return String(line);
+}
+
+// =====================================================
+// SDS011
+// =====================================================
+void sdsSendCommand(const uint8_t *cmd, size_t len) {
+  while (sdsSerial.available()) sdsSerial.read();
+  for (size_t i = 0; i < len; i++) sdsSerial.write(cmd[i]);
+  sdsSerial.flush();
+}
+
+void sdsSleep() {
+  static const uint8_t cmd[] = {
+    0xAA, 0xB4, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x05, 0xAB
+  };
+  sdsSendCommand(cmd, sizeof(cmd));
+  DBG_PRINTLN("[SDS011] SLEEP");
+}
+
+void sdsWake() {
+  static const uint8_t cmd[] = {
+    0xAA, 0xB4, 0x06, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x06, 0xAB
+  };
+  sdsSendCommand(cmd, sizeof(cmd));
+  DBG_PRINTLN("[SDS011] WAKE");
+}
+
+bool readSDS011(float &outPm25, float &outPm10) {
+  while (sdsSerial.available() >= 10) {
+    if ((uint8_t)sdsSerial.read() != 0xAA) continue;
+    if ((uint8_t)sdsSerial.read() != 0xC0) continue;
+
+    uint8_t data[8];
+    int got = sdsSerial.readBytes((char*)data, 8);
+    if (got != 8) return false;
+
+    uint8_t checksum = 0;
+    for (int i = 0; i < 6; i++) checksum += data[i];
+    if (checksum != data[6]) return false;
+    if (data[7] != 0xAB) return false;
+
+    uint16_t rawPm25 = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+    uint16_t rawPm10 = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
+
+    outPm25 = rawPm25 / 10.0f;
+    outPm10 = rawPm10 / 10.0f;
+    return true;
+  }
+  return false;
+}
+
+// =====================================================
+// WIFI / MDNS / APRS
+// =====================================================
+void startMdnsIfNeeded() {
+  if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
+    if (MDNS.begin(MDNS_NAME)) {
+      MDNS.addService("http", "tcp", 80);
+      mdnsStarted = true;
+      DBG_PRINT("[mDNS] Started: http://");
+      DBG_PRINT(MDNS_NAME);
+      DBG_PRINTLN(".local");
+    } else {
+      DBG_PRINTLN("[mDNS] Start failed");
+    }
+  }
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println();
+  Serial.print("[WIFI] Connecting to: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(DEVICE_HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  wl_status_t st = WiFi.status();
+  Serial.print("[WIFI] status=");
+  Serial.println((int)st);
+
+  if (st == WL_CONNECTED) {
+    Serial.print("[WIFI] Connected, IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("[WIFI] Hostname: ");
+    Serial.println(WiFi.hostname());
+    initTime();
+    startMdnsIfNeeded();
+  } else {
+    Serial.println("[WIFI] FAILED");
+  }
+}
+
+bool connectAprs() {
+  if (aprsClient.connected()) return true;
+
+  DBG_PRINTF("[APRS] Connecting to %s:%u\n", APRS_HOST, APRS_PORT);
+  if (!aprsClient.connect(APRS_HOST, APRS_PORT)) {
+    DBG_PRINTLN("[APRS] TCP connect failed");
+    aprsLoggedIn = false;
+    return false;
+  }
+
+  String login = aprsLoginLine();
+  aprsClient.print(login);
+  aprsClient.print("\r\n");
+  aprsLoggedIn = true;
+
+  DBG_PRINT("[APRS] LOGIN >> ");
+  DBG_PRINTLN(login);
+  return true;
+}
+
+void sendAprsLine(const String &line) {
+  DBG_PRINT("[APRS] TX >> ");
+  DBG_PRINTLN(line);
+
+  if (aprsClient.connected()) {
+    aprsClient.print(line);
+    aprsClient.print("\r\n");
+  }
+}
+
+// =====================================================
+// CLOUD
+// =====================================================
+bool sendThingSpeakPrimary(float tempC, float hum, float pressHpa, float vpm25, float vpm10) {
+  WiFiClient client;
+  if (!client.connect(THINGSPEAK_HOST, 80)) {
+    DBG_PRINTLN("[ThingSpeak1] connect failed");
+    return false;
+  }
+
+  String url = "/update?api_key=" + String(THINGSPEAK_API_KEY_1) +
+               "&field1=" + String(tempC, 1) +
+               "&field2=" + String(hum, 1) +
+               "&field3=" + String(pressHpa, 1) +
+               "&field4=" + String(vpm25, 1) +
+               "&field5=" + String(vpm10, 1);
+
+  client.print(String("GET ") + url + " HTTP/1.1\r\nHost: " + THINGSPEAK_HOST + "\r\nConnection: close\r\n\r\n");
+  client.stop();
+  return true;
+}
+
+bool sendThingSpeakSecondary(float tempC, float hum, float pressHpa, float vpm25, float vpm10) {
+  WiFiClient client;
+  if (!client.connect(THINGSPEAK_HOST, 80)) {
+    DBG_PRINTLN("[ThingSpeak2] connect failed");
+    return false;
+  }
+
+  String url = "/update?api_key=" + String(THINGSPEAK_API_KEY_2) +
+               "&field1=" + String(vpm25, 1) +
+               "&field2=" + String(vpm10, 1) +
+               "&field3=" + String(tempC, 1) +
+               "&field4=" + String(hum, 1) +
+               "&field5=" + String(pressHpa, 1);
+
+  client.print(String("GET ") + url + " HTTP/1.1\r\nHost: " + THINGSPEAK_HOST + "\r\nConnection: close\r\n\r\n");
+  client.stop();
+  return true;
+}
+
+bool sendWindy(float tempC, float hum, float pressHpa) {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+
+  if (!client->connect(WINDY_HOST, 443)) {
+    DBG_PRINTLN("[Windy] connect failed");
+    return false;
+  }
+
+  String url = "/pws/update/" + String(WINDY_API_KEY) +
+               "?station=" + String(WINDY_STATION) +
+               "&temp=" + String(tempC, 1) +
+               "&humidity=" + String((int)round(hum)) +
+               "&mbar=" + String(pressHpa, 1);
+
+  client->print(String("GET ") + url + " HTTP/1.1\r\nHost: " + WINDY_HOST + "\r\nConnection: close\r\n\r\n");
+  client->stop();
+  return true;
+}
+
+// =====================================================
+// WWW
+// =====================================================
+String getSystemJson() {
+  String json = "{";
+  json += "\"fwVersion\":\"" + String(FW_VERSION) + "\",";
+  json += "\"wifiConnected\":" + boolText(WiFi.status() == WL_CONNECTED) + ",";
+  json += "\"ip\":\"" + fmtIp() + "\",";
+  json += "\"ssid\":\"" + String(WIFI_SSID) + "\",";
+  json += "\"hostname\":\"" + String(DEVICE_HOSTNAME) + "\",";
+  json += "\"mdns\":\"" + String(MDNS_NAME) + ".local\",";
+  json += "\"mdnsStarted\":" + boolText(mdnsStarted) + ",";
+  json += "\"rssi\":" + String((WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0) + ",";
+  json += "\"aprsConnected\":" + boolText(aprsClient.connected()) + ",";
+  json += "\"aprsLoggedIn\":" + boolText(aprsLoggedIn) + ",";
+  json += "\"timeSynced\":" + boolText(timeSynced) + ",";
+  json += "\"utcNow\":\"" + isoUtcNow() + "\",";
+  json += "\"debugEnabled\":" + boolText(debugEnabled) + ",";
+  json += "\"bmeOk\":" + boolText(bmeOk) + ",";
+  json += "\"sdsAwake\":" + boolText(sdsAwake) + ",";
+  json += "\"sdsWaitingForSample\":" + boolText(sdsWaitingForSample) + ",";
+  json += "\"sdsFreshData\":" + boolText(sdsFreshData) + ",";
+  json += "\"pm25\":" + fmtFloatOrNull(pm25, 1) + ",";
+  json += "\"pm10\":" + fmtFloatOrNull(pm10, 1) + ",";
+  json += "\"temperature\":" + fmtFloatOrNull(lastTempC, 1) + ",";
+  json += "\"humidity\":" + fmtFloatOrNull(lastHum, 1) + ",";
+  json += "\"pressure\":" + fmtFloatOrNull(lastPressHpa, 1) + ",";
+  json += "\"telemSeq\":" + String(telemSeq) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"uptimeText\":\"" + uptimeString() + "\"";
+  json += "}";
+  return json;
+}
+
+String getHtmlPage() {
+  String html;
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>ESP8266 WX Panel</title>";
+  html += "<style>";
+  html += "body{font-family:Arial,sans-serif;background:#101418;color:#eef2f5;margin:0;padding:16px;}";
+  html += "h1{margin:0 0 8px 0;font-size:28px;} p{color:#b8c2cc;}";
+  html += ".top{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 18px 0;}";
+  html += "button{padding:12px 16px;border:0;border-radius:10px;background:#0b7dda;color:#fff;font-size:15px;cursor:pointer;}";
+  html += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;}";
+  html += ".card{background:#182028;border:1px solid #29333d;border-radius:14px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.25);}";
+  html += ".label{font-size:13px;color:#8fa2b5;text-transform:uppercase;letter-spacing:.06em;}";
+  html += ".value{font-size:24px;font-weight:700;margin-top:6px;word-break:break-word;}";
+  html += ".ok{color:#7CFC8A;} .bad{color:#ff7f7f;} .mid{color:#ffd166;}";
+  html += "pre{background:#0d1117;border:1px solid #29333d;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word;}";
+  html += "</style></head><body>";
+  html += "<h1>ESP8266 Weather Station</h1>";
+  html += "<p>Panel lokalny: czujniki, stan systemu, debug przez WWW, hostname i mDNS.</p>";
+  html += "<div class='top'>";
+  html += "<button onclick='toggleDebug()'>Przełącz debug</button>";
+  html += "<button onclick='loadStatus()'>Odśwież teraz</button>";
+  html += "</div>";
+  html += "<div class='grid' id='cards'></div>";
+  html += "<h2>Stan JSON</h2>";
+  html += "<pre id='raw'>Ładowanie...</pre>";
+  html += "<script>";
+  html += "function val(v,u=''){return v===null?'--':String(v)+u;}";
+  html += "function statusClass(v){return v?'ok':'bad';}";
+  html += "function card(title,value,cls){return `<div class='card'><div class='label'>${title}</div><div class='value ${cls||''}'>${value}</div></div>`;}";
+  html += "async function loadStatus(){";
+  html += "let r=await fetch('/status'); let d=await r.json();";
+  html += "let c='';";
+  html += "c+=card('FW', d.fwVersion);";
+  html += "c+=card('Temperature', val(d.temperature,' C'));";
+  html += "c+=card('Humidity', val(d.humidity,' %'));";
+  html += "c+=card('Pressure', val(d.pressure,' hPa'));";
+  html += "c+=card('PM2.5', val(d.pm25,' ug/m3'));";
+  html += "c+=card('PM10', val(d.pm10,' ug/m3'));";
+  html += "c+=card('WiFi', d.wifiConnected?'OK':'OFF', statusClass(d.wifiConnected));";
+  html += "c+=card('APRS TCP', d.aprsConnected?'OK':'OFF', statusClass(d.aprsConnected));";
+  html += "c+=card('APRS Login', d.aprsLoggedIn?'YES':'NO', d.aprsLoggedIn?'ok':'bad');";
+  html += "c+=card('NTP', d.timeSynced?'OK':'NO', statusClass(d.timeSynced));";
+  html += "c+=card('Debug', d.debugEnabled?'ON':'OFF', d.debugEnabled?'mid':'');";
+  html += "c+=card('BME280', d.bmeOk?'OK':'ERR', statusClass(d.bmeOk));";
+  html += "c+=card('SDS Awake', d.sdsAwake?'YES':'NO', d.sdsAwake?'mid':'');";
+  html += "c+=card('SDS Waiting', d.sdsWaitingForSample?'YES':'NO', d.sdsWaitingForSample?'mid':'');";
+  html += "c+=card('SDS Fresh', d.sdsFreshData?'YES':'NO', d.sdsFreshData?'mid':'');";
+  html += "c+=card('RSSI', d.rssi+' dBm');";
+  html += "c+=card('Heap', d.heap+' B');";
+  html += "c+=card('IP', d.ip);";
+  html += "c+=card('Hostname', d.hostname);";
+  html += "c+=card('mDNS', d.mdnsStarted?d.mdns:'not started', d.mdnsStarted?'ok':'bad');";
+  html += "c+=card('Uptime', d.uptimeText);";
+  html += "c+=card('UTC', d.utcNow);";
+  html += "c+=card('Seq', d.telemSeq);";
+  html += "document.getElementById('cards').innerHTML=c;";
+  html += "document.getElementById('raw').textContent=JSON.stringify(d,null,2);";
+  html += "}";
+  html += "async function toggleDebug(){";
+  html += "let r=await fetch('/status'); let d=await r.json();";
+  html += "let newValue = d.debugEnabled ? 0 : 1;";
+  html += "await fetch('/debug?set='+newValue);";
+  html += "await loadStatus();";
+  html += "}";
+  html += "setInterval(loadStatus,3000); loadStatus();";
+  html += "</script></body></html>";
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", getHtmlPage());
+}
+
+void handleStatus() {
+  updateSensorsIfNeeded();
+  updateTimeStatus();
+  server.send(200, "application/json", getSystemJson());
+}
+
+void handleDebug() {
+  if (server.hasArg("set")) {
+    String v = server.arg("set");
+    debugEnabled = (v == "1" || v == "true" || v == "on");
+  }
+
+  String json = "{";
+  json += "\"debugEnabled\":";
+  json += (debugEnabled ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// SERIAL DEBUG
+// =====================================================
+void printSensorBlock() {
+  DBG_PRINTLN("");
+  DBG_PRINTLN("=== SENSOR DATA ===");
+  DBG_PRINT("Temp C   : "); DBG_PRINTLN(fmtFloatOrNull(lastTempC, 1));
+  DBG_PRINT("Hum %    : "); DBG_PRINTLN(fmtFloatOrNull(lastHum, 1));
+  DBG_PRINT("Press hPa: "); DBG_PRINTLN(fmtFloatOrNull(lastPressHpa, 1));
+  DBG_PRINT("PM2.5    : "); DBG_PRINTLN(fmtFloatOrNull(pm25, 1));
+  DBG_PRINT("PM10     : "); DBG_PRINTLN(fmtFloatOrNull(pm10, 1));
+  DBG_PRINT("NTP synced: "); DBG_PRINTLN(timeSynced ? "YES" : "NO");
+  if (timeSynced) {
+    DBG_PRINT("APRS UTC ts: "); DBG_PRINTLN(aprsZuluTimestamp());
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println();
+  Serial.println("=== ESP8266 APRS WX START ===");
+  Serial.print("[FW] ");
+  Serial.println(FW_VERSION);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  bmeOk = bme.begin(0x76);
+  if (!bmeOk) bmeOk = bme.begin(0x77);
+
+  sdsSerial.begin(9600);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(DEVICE_HOSTNAME);
+
+  Serial.print("[HOSTNAME] ");
+  Serial.println(DEVICE_HOSTNAME);
+
+  Serial.print("[BME280] ");
+  Serial.println(bmeOk ? "OK" : "NOT FOUND");
+  Serial.println("[SDS011] Serial started at 9600 baud");
+
+  updateBmeCache();
+
+  delay(1000);
+  sdsSleep();
+  connectWiFi();
+
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/debug", handleDebug);
+  server.begin();
+
+  Serial.println("[HTTP] Web server started");
+  Serial.print("[HTTP] Open by IP: http://");
+  Serial.println(fmtIp());
+  Serial.print("[HTTP] Open by mDNS: http://");
+  Serial.print(MDNS_NAME);
+  Serial.println(".local");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastWiFiCheck >= WIFI_CHECK_MS) {
+    lastWiFiCheck = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      mdnsStarted = false;
+      aprsLoggedIn = false;
+      if (aprsClient.connected()) aprsClient.stop();
+      connectWiFi();
+    }
+  }
+
+  updateTimeStatus();
+  updateSensorsIfNeeded();
+  startMdnsIfNeeded();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    connectAprs();
+  }
+
+  if (!sdsAwake && !sdsWaitingForSample &&
+      (lastSdsCycle == 0 || millis() - lastSdsCycle >= SDS_CYCLE_MS)) {
+    lastSdsCycle = millis();
+    sdsWake();
+    sdsAwake = true;
+    sdsWaitingForSample = true;
+    sdsWakeTime = millis();
+    DBG_PRINTLN("[SDS011] Warmup started");
+  }
+
+  if (sdsAwake && sdsWaitingForSample && millis() - sdsWakeTime >= SDS_WARMUP_MS) {
+    float newPm25, newPm10;
+    bool gotSample = false;
+    unsigned long sampleStart = millis();
+
+    while (millis() - sampleStart < SDS_SAMPLE_MS) {
+      if (readSDS011(newPm25, newPm10)) {
+        pm25 = newPm25;
+        pm10 = newPm10;
+        sdsFreshData = true;
+        gotSample = true;
+        break;
+      }
+      delay(100);
+    }
+
+    sdsSleep();
+    sdsAwake = false;
+    sdsWaitingForSample = false;
+
+    if (gotSample) {
+      DBG_PRINT("[SDS011] Sample OK PM2.5=");
+      DBG_PRINT(String(pm25, 1));
+      DBG_PRINT(" PM10=");
+      DBG_PRINTLN(String(pm10, 1));
+    } else {
+      DBG_PRINTLN("[SDS011] No valid sample after wake");
+    }
+  }
+
+  if (millis() - lastSensorPrint >= SENSOR_PRINT_MS) {
+    lastSensorPrint = millis();
+    printSensorBlock();
+  }
+
+  if (WiFi.status() == WL_CONNECTED && aprsClient.connected()) {
+    if (lastMeta == 0 || millis() - lastMeta >= META_MS) {
+      lastMeta = millis();
+      sendAprsLine(aprsParmLine());
+      sendAprsLine(aprsUnitLine());
+      sendAprsLine(aprsEqnsLine());
+      sendAprsLine(aprsBitsLine());
+    }
+
+    if (millis() - lastTelemetry >= TELEMETRY_MS && sdsFreshData) {
+      lastTelemetry = millis();
+      int pm25i = isnan(pm25) ? 0 : (int)round(pm25);
+      int pm10i = isnan(pm10) ? 0 : (int)round(pm10);
+      sendAprsLine(aprsTelemetryLine(telemSeq, pm25i, pm10i));
+      telemSeq++;
+      if (telemSeq > 999) telemSeq = 1;
+      sdsFreshData = false;
+    }
+
+    if (lastWeather == 0 || millis() - lastWeather >= WEATHER_MS) {
+      lastWeather = millis();
+
+      if (!isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) && timeSynced) {
+        sendAprsLine(aprsWeatherLine(lastTempC, lastHum, lastPressHpa));
+      }
+    }
+
+    if (lastRS == 0 || millis() - lastRS >= RS_MS) {
+      lastRS = millis();
+      sendAprsLine(aprsRadiosondeLine());
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED &&
+      !isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) &&
+      !isnan(pm25) && !isnan(pm10)) {
+
+    if (millis() - lastThingSpeak >= THINGSPEAK_MS) {
+      if (ENABLE_THINGSPEAK_1) sendThingSpeakPrimary(lastTempC, lastHum, lastPressHpa, pm25, pm10);
+      if (ENABLE_THINGSPEAK_2) sendThingSpeakSecondary(lastTempC, lastHum, lastPressHpa, pm25, pm10);
+      lastThingSpeak = millis();
+    }
+
+    if (ENABLE_WINDY && millis() - lastWindy >= WINDY_MS) {
+      sendWindy(lastTempC, lastHum, lastPressHpa);
+      lastWindy = millis();
+    }
+  }
+}
+esp8266_wx.ino 
