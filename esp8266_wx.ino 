@@ -17,14 +17,12 @@
 
 const char* DEVICE_HOSTNAME = "sq4lol-wx";
 const char* MDNS_NAME       = "sq4lol-wx";
-const char* FW_VERSION      = "ESP8266WX 2.3-github";
+const char* FW_VERSION      = "ESP8266WX 2.4-windy-v2";
 
-// --- APRS public ---
+// --- APRS public config ---
 const char* APRS_HOST    = "poland.aprs2.net";
 const uint16_t APRS_PORT = 14580;
-const char* APRS_CALL_WX = "SQ4LOL-15";
-const char* APRS_CALL_RS = "SQ4LOL-12";
-const char* APRS_VERS    = "ESP8266WX 2.3";
+const char* APRS_VERS    = "ESP8266WX 2.4";
 const char* APRS_DEST    = "APRS";
 
 // --- NTP ---
@@ -38,13 +36,6 @@ const char* THINGSPEAK_HOST = "api.thingspeak.com";
 
 const bool ENABLE_WINDY = true;
 const char* WINDY_HOST = "stations.windy.com";
-const char* WINDY_STATION = "1";
-
-// --- Lokalizacja ---
-const char* LAT_WX = "5244.46N";
-const char* LON_WX = "02333.50E";
-const char* LAT_RS = "5244.44N";
-const char* LON_RS = "02333.50E";
 
 // --- Piny ---
 const uint8_t SDS_RX_PIN = D6;
@@ -461,24 +452,51 @@ bool sendThingSpeakSecondary(float tempC, float hum, float pressHpa, float vpm25
   return true;
 }
 
-bool sendWindy(float tempC, float hum, float pressHpa) {
+bool sendWindyV2(float tempC, float hum, float pressHpa) {
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
 
   if (!client->connect(WINDY_HOST, 443)) {
-    DBG_PRINTLN("[Windy] connect failed");
+    DBG_PRINTLN("[Windy v2] connect failed");
     return false;
   }
 
-  String url = "/pws/update/" + String(WINDY_API_KEY) +
-               "?station=" + String(WINDY_STATION) +
+  long pressurePa = lround(pressHpa * 100.0f);
+  long ts = time(nullptr);
+
+  String url = "/api/v2/observation/update"
+               "?id=" + String(WINDY_STATION_ID) +
+               "&ts=" + String(ts) +
                "&temp=" + String(tempC, 1) +
                "&humidity=" + String((int)round(hum)) +
-               "&mbar=" + String(pressHpa, 1);
+               "&pressure=" + String(pressurePa) +
+               "&softwaretype=ESP8266WX_2.4";
 
-  client->print(String("GET ") + url + " HTTP/1.1\r\nHost: " + WINDY_HOST + "\r\nConnection: close\r\n\r\n");
+  DBG_PRINT("[Windy v2] URL: ");
+  DBG_PRINTLN(url);
+
+  client->print(String("POST ") + url + " HTTP/1.1\r\n" +
+                "Host: " + WINDY_HOST + "\r\n" +
+                "Authorization: Bearer " + WINDY_STATION_PASSWORD + "\r\n" +
+                "Connection: close\r\n" +
+                "Content-Length: 0\r\n\r\n");
+
+  unsigned long timeout = millis();
+  bool gotHttp200 = false;
+
+  while (client->connected() && millis() - timeout < 5000) {
+    while (client->available()) {
+      String line = client->readStringUntil('\n');
+      DBG_PRINTLN(line);
+      timeout = millis();
+      if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
+        gotHttp200 = true;
+      }
+    }
+  }
+
   client->stop();
-  return true;
+  return gotHttp200;
 }
 
 // =====================================================
@@ -787,10 +805,9 @@ void loop() {
       lastThingSpeak = millis();
     }
 
-    if (ENABLE_WINDY && millis() - lastWindy >= WINDY_MS) {
-      sendWindy(lastTempC, lastHum, lastPressHpa);
+    if (ENABLE_WINDY && timeSynced && millis() - lastWindy >= WINDY_MS) {
+      sendWindyV2(lastTempC, lastHum, lastPressHpa);
       lastWindy = millis();
     }
   }
 }
-esp8266_wx.ino 
