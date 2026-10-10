@@ -13,11 +13,11 @@
 
 const char* DEVICE_HOSTNAME = "sq4lol-wx";
 const char* MDNS_NAME       = "sq4lol-wx";
-const char* FW_VERSION      = "ESP8266WX 2.8-one-ts";
+const char* FW_VERSION      = "ESP8266WX 3.1-sensors-back";
 
 const char* APRS_HOST    = "poland.aprs2.net";
 const uint16_t APRS_PORT = 14580;
-const char* APRS_VERS    = "ESP8266WX 2.8";
+const char* APRS_VERS    = "ESP8266WX 3.1";
 const char* APRS_DEST    = "APRS";
 
 const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -36,22 +36,24 @@ const uint8_t I2C_SCL_PIN = D1;
 
 const unsigned long SENSOR_PRINT_MS = 10000UL;
 const unsigned long SENSOR_CACHE_MS = 5000UL;
-const unsigned long TELEMETRY_MS    = 600000UL;
-const unsigned long WEATHER_MS      = 600000UL;
-const unsigned long META_MS         = 21600000UL;
-const unsigned long RS_MS           = 1800000UL;
-const unsigned long WIFI_CHECK_MS   = 15000UL;
-const unsigned long THINGSPEAK_MS   = 600000UL;
-const unsigned long WINDY_MS        = 600000UL;
 
-const unsigned long SDS_CYCLE_MS    = 600000UL;
+const unsigned long SDS_CYCLE_MS    = 600000UL;   // 10 min
 const unsigned long SDS_WARMUP_MS   = 35000UL;
 const unsigned long SDS_SAMPLE_MS   = 5000UL;
+
+const unsigned long TELEMETRY_MS    = 600000UL;   // 10 min
+const unsigned long WEATHER_MS      = 660000UL;   // 11 min
+const unsigned long THINGSPEAK_MS   = 720000UL;   // 12 min
+const unsigned long WINDY_MS        = 780000UL;   // 13 min
+const unsigned long META_MS         = 21600000UL; // 6 h
+const unsigned long RS_MS           = 1800000UL;  // 30 min
+const unsigned long WIFI_CHECK_MS   = 15000UL;
 
 Adafruit_BME280 bme;
 SoftwareSerial sdsSerial(SDS_RX_PIN, SDS_TX_PIN);
 WiFiClient aprsClient;
 ESP8266WebServer server(80);
+BearSSL::WiFiClientSecure windyClient;
 
 float pm25 = NAN;
 float pm10 = NAN;
@@ -108,24 +110,10 @@ String windyLastError = "never sent";
 #define DBG_PRINTF(...)  do { if (debugEnabled) Serial.printf(__VA_ARGS__); } while (0)
 
 String boolText(bool v) { return v ? "true" : "false"; }
-String fmtFloatOrNull(float v, int prec = 1) { if (isnan(v)) return "null"; return String(v, prec); }
-String fmtIp() { if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString(); return String("0.0.0.0"); }
 
-String uptimeString() {
-  unsigned long s = millis() / 1000UL, d = s / 86400UL; s %= 86400UL;
-  unsigned long h = s / 3600UL; s %= 3600UL; unsigned long m = s / 60UL; s %= 60UL;
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%lud %02luh %02lum %02lus", d, h, m, s);
-  return String(buf);
-}
-
-String ageSecondsToText(unsigned long msAgo) {
-  unsigned long s = msAgo / 1000UL, d = s / 86400UL; s %= 86400UL;
-  unsigned long h = s / 3600UL; s %= 3600UL; unsigned long m = s / 60UL; s %= 60UL;
-  char buf[40];
-  if (d > 0) snprintf(buf, sizeof(buf), "%lud %02luh %02lum %02lus", d, h, m, s);
-  else snprintf(buf, sizeof(buf), "%02luh %02lum %02lus", h, m, s);
-  return String(buf);
+String fmtFloatOrNull(float v, int prec = 1) {
+  if (isnan(v)) return "null";
+  return String(v, prec);
 }
 
 String jsonEscape(const String &input) {
@@ -187,18 +175,6 @@ String aprsZuluTimestamp() {
   gmtime_r(&now, &tmUtc);
   char buf[8];
   snprintf(buf, sizeof(buf), "%02d%02d%02dz", tmUtc.tm_mday, tmUtc.tm_hour, tmUtc.tm_min);
-  return String(buf);
-}
-
-String isoUtcNow() {
-  if (!timeSynced) return String("unsynced");
-  time_t now = time(nullptr);
-  struct tm tmUtc;
-  gmtime_r(&now, &tmUtc);
-  char buf[24];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d UTC",
-           tmUtc.tm_year + 1900, tmUtc.tm_mon + 1, tmUtc.tm_mday,
-           tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
   return String(buf);
 }
 
@@ -339,6 +315,7 @@ void connectWiFi() {
   while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
     delay(500);
     Serial.print(".");
+    yield();
   }
   Serial.println();
 
@@ -412,21 +389,21 @@ bool sendThingSpeakPrimary(float tempC, float hum, float pressHpa, float vpm25, 
   bool inBody = false;
 
   while ((client.connected() || client.available()) && millis() - timeout < 8000) {
+    yield();
     while (client.available()) {
+      yield();
       String line = client.readStringUntil('\n');
       timeout = millis();
 
       if (!gotHeaders) {
         String trimmed = line;
         trimmed.trim();
-
         if (trimmed.length() > 0 && firstLine.length() == 0) {
           firstLine = trimmed;
           if (trimmed.startsWith("HTTP/1.1 ") || trimmed.startsWith("HTTP/1.0 ")) {
             thingSpeakLastHttpCode = trimmed.substring(9, 12).toInt();
           }
         }
-
         if (line == "\r" || trimmed.length() == 0) {
           gotHeaders = true;
           inBody = true;
@@ -448,15 +425,10 @@ bool sendThingSpeakPrimary(float tempC, float hum, float pressHpa, float vpm25, 
   }
 
   thingSpeakFailCount++;
-  if (thingSpeakLastHttpCode == 200 && body == "0") {
-    thingSpeakLastError = "entry 0";
-  } else if (body.length() > 0) {
-    thingSpeakLastError = body;
-  } else if (firstLine.length() > 0) {
-    thingSpeakLastError = firstLine;
-  } else {
-    thingSpeakLastError = "timeout/no response";
-  }
+  if (thingSpeakLastHttpCode == 200 && body == "0") thingSpeakLastError = "entry 0";
+  else if (body.length() > 0) thingSpeakLastError = body;
+  else if (firstLine.length() > 0) thingSpeakLastError = firstLine;
+  else thingSpeakLastError = "timeout/no response";
 
   return false;
 }
@@ -465,12 +437,13 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   lastWindyAttempt = millis();
   windyLastOk = false;
   windyLastHttpCode = 0;
-  windyLastError = "unknown";
+  windyLastError = "pending";
 
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  if (windyClient.connected()) windyClient.stop();
+  windyClient.setInsecure();
+  windyClient.setBufferSizes(512, 512);
 
-  if (!client->connect(WINDY_HOST, 443)) {
+  if (!windyClient.connect(WINDY_HOST, 443)) {
     windyLastError = "connect failed";
     windyFailCount++;
     return false;
@@ -480,7 +453,7 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   float baroInHg = pressHpa * 0.0295299831f;
 
   String url = "/api/v2/observation/update"
-               "?stationtype=ESP8266WX_2.8"
+               "?stationtype=ESP8266WX_3.1"
                "&ID=" + String(WINDY_STATION_ID) +
                "&PASSWORD=" + String(WINDY_STATION_PASSWORD) +
                "&dateutc=now"
@@ -492,17 +465,17 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   DBG_PRINT("[Windy] URL: ");
   DBG_PRINTLN(url);
 
-  client->print(String("GET ") + url + " HTTP/1.1\r\n" +
-                "Host: " + WINDY_HOST + "\r\n" +
-                "Connection: close\r\n\r\n");
+  windyClient.print(String("GET ") + url + " HTTP/1.1\r\nHost: " + WINDY_HOST + "\r\nConnection: close\r\n\r\n");
 
   unsigned long timeout = millis();
   String firstLine = "";
   bool gotHeaders = false;
 
-  while (client->connected() && millis() - timeout < 5000) {
-    while (client->available()) {
-      String line = client->readStringUntil('\n');
+  while ((windyClient.connected() || windyClient.available()) && millis() - timeout < 7000) {
+    yield();
+    while (windyClient.available()) {
+      yield();
+      String line = windyClient.readStringUntil('\n');
       line.trim();
       timeout = millis();
 
@@ -516,7 +489,7 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
     }
   }
 
-  client->stop();
+  windyClient.stop();
 
   if (windyLastHttpCode == 200) {
     windyLastOk = true;
@@ -532,58 +505,25 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
 
 String getSystemJson() {
   String json = "{";
-  json += "\"fwVersion\":\"" + String(FW_VERSION) + "\",";
-  json += "\"wifiConnected\":" + boolText(WiFi.status() == WL_CONNECTED) + ",";
-  json += "\"ip\":\"" + fmtIp() + "\",";
-  json += "\"ssid\":\"" + String(WIFI_SSID) + "\",";
-  json += "\"hostname\":\"" + String(DEVICE_HOSTNAME) + "\",";
-  json += "\"mdns\":\"" + String(MDNS_NAME) + ".local\",";
-  json += "\"mdnsStarted\":" + boolText(mdnsStarted) + ",";
-  json += "\"rssi\":" + String((WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0) + ",";
-  json += "\"aprsConnected\":" + boolText(aprsClient.connected()) + ",";
-  json += "\"aprsLoggedIn\":" + boolText(aprsLoggedIn) + ",";
-  json += "\"aprsLastOk\":" + boolText(aprsLastOk) + ",";
-  json += "\"aprsFailCount\":" + String(aprsFailCount) + ",";
-  json += "\"aprsLastError\":\"" + jsonEscape(aprsLastError) + "\",";
-  json += "\"aprsLastPacket\":\"" + jsonEscape(aprsLastPacket) + "\",";
-  json += "\"aprsLastAttemptMs\":" + String(lastAprsAttempt) + ",";
-  json += "\"aprsLastSuccessMs\":" + String(lastAprsSuccess) + ",";
-  json += "\"aprsAttemptAge\":\"" + (lastAprsAttempt ? ageSecondsToText(millis() - lastAprsAttempt) : String("never")) + "\",";
-  json += "\"aprsSuccessAge\":\"" + (lastAprsSuccess ? ageSecondsToText(millis() - lastAprsSuccess) : String("never")) + "\",";
-  json += "\"timeSynced\":" + boolText(timeSynced) + ",";
-  json += "\"utcNow\":\"" + isoUtcNow() + "\",";
-  json += "\"debugEnabled\":" + boolText(debugEnabled) + ",";
-  json += "\"bmeOk\":" + boolText(bmeOk) + ",";
-  json += "\"sdsAwake\":" + boolText(sdsAwake) + ",";
-  json += "\"sdsWaitingForSample\":" + boolText(sdsWaitingForSample) + ",";
-  json += "\"sdsFreshData\":" + boolText(sdsFreshData) + ",";
-  json += "\"pm25\":" + fmtFloatOrNull(pm25, 1) + ",";
-  json += "\"pm10\":" + fmtFloatOrNull(pm10, 1) + ",";
   json += "\"temperature\":" + fmtFloatOrNull(lastTempC, 1) + ",";
   json += "\"humidity\":" + fmtFloatOrNull(lastHum, 1) + ",";
   json += "\"pressure\":" + fmtFloatOrNull(lastPressHpa, 1) + ",";
-  json += "\"telemSeq\":" + String(telemSeq) + ",";
-  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
-  json += "\"uptimeMs\":" + String(millis()) + ",";
-  json += "\"uptimeText\":\"" + uptimeString() + "\",";
+  json += "\"pm25\":" + fmtFloatOrNull(pm25, 1) + ",";
+  json += "\"pm10\":" + fmtFloatOrNull(pm10, 1) + ",";
+
+  json += "\"aprsConnected\":" + boolText(aprsClient.connected()) + ",";
+  json += "\"aprsLoggedIn\":" + boolText(aprsLoggedIn) + ",";
+  json += "\"aprsLastOk\":" + boolText(aprsLastOk) + ",";
+  json += "\"aprsLastError\":\"" + jsonEscape(aprsLastError) + "\",";
+
   json += "\"thingSpeakLastOk\":" + boolText(thingSpeakLastOk) + ",";
   json += "\"thingSpeakLastHttpCode\":" + String(thingSpeakLastHttpCode) + ",";
-  json += "\"thingSpeakFailCount\":" + String(thingSpeakFailCount) + ",";
   json += "\"thingSpeakLastError\":\"" + jsonEscape(thingSpeakLastError) + "\",";
-  json += "\"thingSpeakLastAttemptMs\":" + String(lastThingSpeakAttempt) + ",";
-  json += "\"thingSpeakLastSuccessMs\":" + String(lastThingSpeakSuccess) + ",";
-  json += "\"thingSpeakAttemptAge\":\"" + (lastThingSpeakAttempt ? ageSecondsToText(millis() - lastThingSpeakAttempt) : String("never")) + "\",";
-  json += "\"thingSpeakSuccessAge\":\"" + (lastThingSpeakSuccess ? ageSecondsToText(millis() - lastThingSpeakSuccess) : String("never")) + "\",";
+
   json += "\"windyEnabled\":" + boolText(ENABLE_WINDY) + ",";
-  json += "\"windyHost\":\"" + String(WINDY_HOST) + "\",";
   json += "\"windyLastOk\":" + boolText(windyLastOk) + ",";
   json += "\"windyLastHttpCode\":" + String(windyLastHttpCode) + ",";
-  json += "\"windyFailCount\":" + String(windyFailCount) + ",";
-  json += "\"windyLastError\":\"" + jsonEscape(windyLastError) + "\",";
-  json += "\"windyLastAttemptMs\":" + String(lastWindyAttempt) + ",";
-  json += "\"windyLastSuccessMs\":" + String(lastWindySuccess) + ",";
-  json += "\"windyAttemptAge\":\"" + (lastWindyAttempt ? ageSecondsToText(millis() - lastWindyAttempt) : String("never")) + "\",";
-  json += "\"windySuccessAge\":\"" + (lastWindySuccess ? ageSecondsToText(millis() - lastWindySuccess) : String("never")) + "\"";
+  json += "\"windyLastError\":\"" + jsonEscape(windyLastError) + "\"";
   json += "}";
   return json;
 }
@@ -604,23 +544,32 @@ String getHtmlPage() {
   html += "pre{background:#0d1117;border:1px solid #29333d;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word;}";
   html += "</style></head><body>";
   html += "<h1>ESP8266 Weather Station</h1>";
-  html += "<p>Panel lokalny: czujniki, status wysylki APRS / ThingSpeak / Windy, debug przez WWW, hostname i mDNS.</p>";
+  html += "<p>Panel lokalny: pomiary BME280 / SDS011 oraz status wysylki APRS / ThingSpeak / Windy.</p>";
   html += "<div class='top'><button onclick='toggleDebug()'>Przelacz debug</button><button onclick='loadStatus()'>Odswiez teraz</button></div>";
   html += "<div class='grid' id='cards'></div><h2>Stan JSON</h2><pre id='raw'>Ladowanie...</pre>";
   html += "<script>";
-  html += "function val(v,u=''){return v===null?'--':String(v)+u;}";
   html += "function statusClass(v){return v?'ok':'bad';}";
-  html += "function ageClass(txt){if(!txt||txt==='never')return 'bad';if(txt.includes('d'))return 'bad';let h=0,m=0;let mh=txt.match(/(\\d+)h/);let mm=txt.match(/(\\d+)m/);if(mh)h=parseInt(mh[1],10);if(mm)m=parseInt(mm[1],10);let total=h*60+m;if(total>=60)return 'bad';if(total>=15)return 'mid';return 'ok';}";
   html += "function card(title,value,cls,small){return `<div class='card'><div class='label'>${title}</div><div class='value ${(cls||'')} ${(small?'small':'')}'>${value}</div></div>`;}";
   html += "async function loadStatus(){let r=await fetch('/status');let d=await r.json();let c='';";
-  html += "c+=card('FW',d.fwVersion);c+=card('Temperature',val(d.temperature,' C'));c+=card('Humidity',val(d.humidity,' %'));c+=card('Pressure',val(d.pressure,' hPa'));c+=card('PM2.5',val(d.pm25,' ug/m3'));c+=card('PM10',val(d.pm10,' ug/m3'));";
-  html += "c+=card('APRS TCP',d.aprsConnected?'OK':'OFF',statusClass(d.aprsConnected));c+=card('APRS Login',d.aprsLoggedIn?'YES':'NO',d.aprsLoggedIn?'ok':'bad');c+=card('APRS status',d.aprsLastOk?'OK':'FAIL',d.aprsLastOk?'ok':'bad');c+=card('APRS last success',d.aprsSuccessAge,ageClass(d.aprsSuccessAge));c+=card('APRS fails',d.aprsFailCount,d.aprsFailCount>0?'bad':'ok');c+=card('APRS error',d.aprsLastError||'--',d.aprsLastOk?'ok':'bad',true);";
-  html += "c+=card('ThingSpeak status',d.thingSpeakLastOk?'OK':'FAIL',d.thingSpeakLastOk?'ok':'bad');c+=card('ThingSpeak HTTP',d.thingSpeakLastHttpCode||0,d.thingSpeakLastOk?'ok':'mid');c+=card('ThingSpeak last success',d.thingSpeakSuccessAge,ageClass(d.thingSpeakSuccessAge));c+=card('ThingSpeak fails',d.thingSpeakFailCount,d.thingSpeakFailCount>0?'bad':'ok');c+=card('ThingSpeak error',d.thingSpeakLastError||'--',d.thingSpeakLastOk?'ok':'bad',true);";
-  html += "c+=card('Windy enabled',d.windyEnabled?'YES':'NO',d.windyEnabled?'ok':'mid');c+=card('Windy status',d.windyLastOk?'OK':'FAIL',d.windyLastOk?'ok':'bad');c+=card('Windy HTTP',d.windyLastHttpCode||0,d.windyLastOk?'ok':'mid');c+=card('Windy last success',d.windySuccessAge,ageClass(d.windySuccessAge));c+=card('Windy fails',d.windyFailCount,d.windyFailCount>0?'bad':'ok');c+=card('Windy error',d.windyLastError||'--',d.windyLastOk?'ok':'bad',true);";
-  html += "c+=card('WiFi',d.wifiConnected?'OK':'OFF',statusClass(d.wifiConnected));c+=card('NTP',d.timeSynced?'OK':'NO',statusClass(d.timeSynced));c+=card('Debug',d.debugEnabled?'ON':'OFF',d.debugEnabled?'mid':'');c+=card('BME280',d.bmeOk?'OK':'ERR',statusClass(d.bmeOk));c+=card('SDS Awake',d.sdsAwake?'YES':'NO',d.sdsAwake?'mid':'');c+=card('SDS Waiting',d.sdsWaitingForSample?'YES':'NO',d.sdsWaitingForSample?'mid':'');c+=card('SDS Fresh',d.sdsFreshData?'YES':'NO',d.sdsFreshData?'mid':'');c+=card('RSSI',d.rssi+' dBm');c+=card('Heap',d.heap+' B');c+=card('IP',d.ip);c+=card('Hostname',d.hostname);c+=card('mDNS',d.mdnsStarted?d.mdns:'not started',d.mdnsStarted?'ok':'bad');c+=card('Uptime',d.uptimeText);c+=card('UTC',d.utcNow);c+=card('Seq',d.telemSeq);";
+  html += "c+=card('Temperatura',d.temperature ?? '--','mid');";
+  html += "c+=card('Wilgotnosc',d.humidity ?? '--','mid');";
+  html += "c+=card('Cisnienie',d.pressure ?? '--','mid');";
+  html += "c+=card('PM2.5',d.pm25 ?? '--','mid');";
+  html += "c+=card('PM10',d.pm10 ?? '--','mid');";
+  html += "c+=card('APRS TCP',d.aprsConnected?'OK':'OFF',statusClass(d.aprsConnected));";
+  html += "c+=card('APRS Login',d.aprsLoggedIn?'YES':'NO',d.aprsLoggedIn?'ok':'bad');";
+  html += "c+=card('APRS status',d.aprsLastOk?'OK':'FAIL',d.aprsLastOk?'ok':'bad');";
+  html += "c+=card('APRS error',d.aprsLastError||'--',d.aprsLastOk?'ok':'bad',true);";
+  html += "c+=card('ThingSpeak status',d.thingSpeakLastOk?'OK':'FAIL',d.thingSpeakLastOk?'ok':'bad');";
+  html += "c+=card('ThingSpeak HTTP',d.thingSpeakLastHttpCode||0,d.thingSpeakLastOk?'ok':'mid');";
+  html += "c+=card('ThingSpeak error',d.thingSpeakLastError||'--',d.thingSpeakLastOk?'ok':'bad',true);";
+  html += "c+=card('Windy enabled',d.windyEnabled?'YES':'NO',d.windyEnabled?'ok':'mid');";
+  html += "c+=card('Windy status',d.windyLastOk?'OK':'FAIL',d.windyLastOk?'ok':'bad');";
+  html += "c+=card('Windy HTTP',d.windyLastHttpCode||0,d.windyLastOk?'ok':'mid');";
+  html += "c+=card('Windy error',d.windyLastError||'--',d.windyLastOk?'ok':'bad',true);";
   html += "document.getElementById('cards').innerHTML=c;document.getElementById('raw').textContent=JSON.stringify(d,null,2);}";
-  html += "async function toggleDebug(){let r=await fetch('/status');let d=await r.json();let newValue=d.debugEnabled?0:1;await fetch('/debug?set='+newValue);await loadStatus();}";
-  html += "setInterval(loadStatus,3000);loadStatus();";
+  html += "async function toggleDebug(){window._dbgState=!window._dbgState;let newValue=window._dbgState?1:0;await fetch('/debug?set='+newValue);await loadStatus();}";
+  html += "setInterval(loadStatus,5000);loadStatus();";
   html += "</script></body></html>";
   return html;
 }
@@ -630,8 +579,6 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  updateSensorsIfNeeded();
-  updateTimeStatus();
   server.send(200, "application/json", getSystemJson());
 }
 
@@ -650,11 +597,11 @@ void handleDebug() {
 void printSensorBlock() {
   DBG_PRINTLN("");
   DBG_PRINTLN("=== SENSOR DATA ===");
-  DBG_PRINT("Temp C   : "); DBG_PRINTLN(fmtFloatOrNull(lastTempC, 1));
-  DBG_PRINT("Hum %    : "); DBG_PRINTLN(fmtFloatOrNull(lastHum, 1));
-  DBG_PRINT("Press hPa: "); DBG_PRINTLN(fmtFloatOrNull(lastPressHpa, 1));
-  DBG_PRINT("PM2.5    : "); DBG_PRINTLN(fmtFloatOrNull(pm25, 1));
-  DBG_PRINT("PM10     : "); DBG_PRINTLN(fmtFloatOrNull(pm10, 1));
+  DBG_PRINT("Temp C   : "); DBG_PRINTLN(lastTempC);
+  DBG_PRINT("Hum %    : "); DBG_PRINTLN(lastHum);
+  DBG_PRINT("Press hPa: "); DBG_PRINTLN(lastPressHpa);
+  DBG_PRINT("PM2.5    : "); DBG_PRINTLN(pm25);
+  DBG_PRINT("PM10     : "); DBG_PRINTLN(pm10);
   DBG_PRINT("APRS OK  : "); DBG_PRINTLN(aprsLastOk ? "YES" : "NO");
   DBG_PRINT("TS OK    : "); DBG_PRINTLN(thingSpeakLastOk ? "YES" : "NO");
   DBG_PRINT("Windy OK : "); DBG_PRINTLN(windyLastOk ? "YES" : "NO");
@@ -679,6 +626,9 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.hostname(DEVICE_HOSTNAME);
 
+  windyClient.setInsecure();
+  windyClient.setBufferSizes(512, 512);
+
   updateBmeCache();
   delay(1000);
   sdsSleep();
@@ -688,10 +638,18 @@ void setup() {
   server.on("/status", handleStatus);
   server.on("/debug", handleDebug);
   server.begin();
+
+  unsigned long now = millis();
+  lastSdsCycle   = now;
+  lastTelemetry  = now;
+  lastWeather    = now - 60000UL;
+  lastThingSpeak = now - 120000UL;
+  lastWindy      = now - 180000UL;
 }
 
 void loop() {
   server.handleClient();
+  yield();
 
   if (millis() - lastWiFiCheck >= WIFI_CHECK_MS) {
     lastWiFiCheck = millis();
@@ -699,6 +657,7 @@ void loop() {
       mdnsStarted = false;
       aprsLoggedIn = false;
       if (aprsClient.connected()) aprsClient.stop();
+      if (windyClient.connected()) windyClient.stop();
       connectWiFi();
     }
   }
@@ -724,6 +683,7 @@ void loop() {
     unsigned long sampleStart = millis();
 
     while (millis() - sampleStart < SDS_SAMPLE_MS) {
+      yield();
       if (readSDS011(newPm25, newPm10)) {
         pm25 = newPm25;
         pm10 = newPm10;
@@ -762,10 +722,9 @@ void loop() {
       sendAprsLine(aprsTelemetryLine(telemSeq, pm25i, pm10i));
       telemSeq++;
       if (telemSeq > 999) telemSeq = 1;
-      sdsFreshData = false;
     }
 
-    if (lastWeather == 0 || millis() - lastWeather >= WEATHER_MS) {
+    if (millis() - lastWeather >= WEATHER_MS) {
       lastWeather = millis();
       if (!isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) && timeSynced) {
         sendAprsLine(aprsWeatherLine(lastTempC, lastHum, lastPressHpa));
@@ -781,11 +740,10 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED &&
       ENABLE_THINGSPEAK &&
       !isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) &&
-      !isnan(pm25) && !isnan(pm10)) {
-    if (millis() - lastThingSpeak >= THINGSPEAK_MS) {
-      thingSpeakLastOk = sendThingSpeakPrimary(lastTempC, lastHum, lastPressHpa, pm25, pm10);
-      lastThingSpeak = millis();
-    }
+      !isnan(pm25) && !isnan(pm10) &&
+      millis() - lastThingSpeak >= THINGSPEAK_MS) {
+    thingSpeakLastOk = sendThingSpeakPrimary(lastTempC, lastHum, lastPressHpa, pm25, pm10);
+    lastThingSpeak = millis();
   }
 
   if (WiFi.status() == WL_CONNECTED &&
@@ -795,5 +753,9 @@ void loop() {
       millis() - lastWindy >= WINDY_MS) {
     sendWindyV2(lastTempC, lastHum, lastPressHpa);
     lastWindy = millis();
+  }
+
+  if (sdsFreshData && lastTelemetry != 0 && millis() - lastTelemetry < 10000UL) {
+    sdsFreshData = false;
   }
 }
