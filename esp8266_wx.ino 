@@ -1,6 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecureBearSSL.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <Wire.h>
@@ -17,12 +18,12 @@
 
 const char* DEVICE_HOSTNAME = "sq4lol-wx";
 const char* MDNS_NAME       = "sq4lol-wx";
-const char* FW_VERSION      = "ESP8266WX 2.5-ts265521-windypass";
+const char* FW_VERSION      = "ESP8266WX 2.6-ts265521-windyhttpclient";
 
 // --- APRS public config ---
 const char* APRS_HOST    = "poland.aprs2.net";
 const uint16_t APRS_PORT = 14580;
-const char* APRS_VERS    = "ESP8266WX 2.5";
+const char* APRS_VERS    = "ESP8266WX 2.6";
 const char* APRS_DEST    = "APRS";
 
 // --- NTP ---
@@ -100,6 +101,7 @@ unsigned long lastWindyTry    = 0;
 bool windyLastOk = false;
 int windyLastHttpCode = 0;
 String windyLastStatusLine = "";
+String windyLastBody = "";
 unsigned long windySuccessCount = 0;
 unsigned long windyFailCount = 0;
 time_t windyLastAttemptTs = 0;
@@ -165,6 +167,21 @@ String fmtUnixAsUtc(time_t ts) {
            tmUtc.tm_year + 1900, tmUtc.tm_mon + 1, tmUtc.tm_mday,
            tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
   return String(buf);
+}
+
+String jsonEscape(const String &s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else out += c;
+  }
+  return out;
 }
 
 void updateBmeCache() {
@@ -434,8 +451,6 @@ void sendAprsLine(const String &line) {
 
 // =====================================================
 // CLOUD
-// ThingSpeak channel 265521:
-// field1=PM25, field2=PM10, field3=Temperature, field4=Humidity, field5=Pressure
 // =====================================================
 bool sendThingSpeak265521(float tempC, float hum, float pressHpa, float vpm25, float vpm10) {
   WiFiClient client;
@@ -465,65 +480,57 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
 
   windyLastAttemptTs = time(nullptr);
   windyLastHttpCode = 0;
-  windyLastStatusLine = "connect-start";
-
-  if (!client->connect(WINDY_HOST, 443)) {
-    DBG_PRINTLN("[Windy v2] connect failed");
-    windyLastOk = false;
-    windyFailCount++;
-    windyLastStatusLine = "connect-failed";
-    return false;
-  }
+  windyLastStatusLine = "request-init";
+  windyLastBody = "";
 
   long pressurePa = lround(pressHpa * 100.0f);
   long ts = time(nullptr);
 
-  String url = "/api/v2/observation/update"
+  String url = String("https://") + WINDY_HOST +
+               "/api/v2/observation/update"
                "?id=" + String(WINDY_STATION_ID) +
                "&PASSWORD=" + String(WINDY_STATION_PASSWORD) +
                "&ts=" + String(ts) +
                "&temp=" + String(tempC, 1) +
                "&humidity=" + String((int)round(hum)) +
                "&pressure=" + String(pressurePa) +
-               "&softwaretype=ESP8266WX_2.5";
+               "&softwaretype=ESP8266WX_2.6";
 
   DBG_PRINT("[Windy v2] URL: ");
   DBG_PRINTLN(url);
 
-  client->print(String("POST ") + url + " HTTP/1.1\r\n" +
-                "Host: " + WINDY_HOST + "\r\n" +
-                "Connection: close\r\n" +
-                "Content-Length: 0\r\n\r\n");
+  HTTPClient https;
+  https.setTimeout(8000);
+  https.setReuse(false);
 
-  unsigned long timeout = millis();
-  bool firstLineSeen = false;
-
-  while (client->connected() && millis() - timeout < 5000) {
-    while (client->available()) {
-      String line = client->readStringUntil('\n');
-      line.trim();
-      if (line.length() == 0) continue;
-
-      DBG_PRINTLN(line);
-      timeout = millis();
-
-      if (!firstLineSeen && line.startsWith("HTTP/1.")) {
-        firstLineSeen = true;
-        windyLastStatusLine = line;
-
-        int p1 = line.indexOf(' ');
-        int p2 = line.indexOf(' ', p1 + 1);
-        if (p1 > 0 && p2 > p1) {
-          windyLastHttpCode = line.substring(p1 + 1, p2).toInt();
-        }
-      }
-    }
-    delay(1);
+  if (!https.begin(*client, url)) {
+    DBG_PRINTLN("[Windy v2] HTTP begin failed");
+    windyLastOk = false;
+    windyFailCount++;
+    windyLastStatusLine = "http-begin-failed";
+    return false;
   }
 
-  client->stop();
+  int httpCode = https.GET();
+  windyLastHttpCode = httpCode;
 
-  bool ok = (windyLastHttpCode >= 200 && windyLastHttpCode < 300);
+  if (httpCode > 0) {
+    windyLastStatusLine = String("HTTP ") + String(httpCode);
+    windyLastBody = https.getString();
+    DBG_PRINTF("[Windy v2] HTTP code: %d\n", httpCode);
+    if (windyLastBody.length()) {
+      DBG_PRINT("[Windy v2] BODY: ");
+      DBG_PRINTLN(windyLastBody);
+    }
+  } else {
+    windyLastStatusLine = String("HTTPClient error: ") + https.errorToString(httpCode);
+    DBG_PRINT("[Windy v2] ");
+    DBG_PRINTLN(windyLastStatusLine);
+  }
+
+  https.end();
+
+  bool ok = (httpCode == 200 || httpCode == 409);
   windyLastOk = ok;
 
   if (ok) {
@@ -531,7 +538,6 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
     windySuccessCount++;
   } else {
     windyFailCount++;
-    if (windyLastStatusLine.length() == 0) windyLastStatusLine = "no-http-status";
   }
 
   return ok;
@@ -571,7 +577,8 @@ String getSystemJson() {
   json += "\"windyEnabled\":" + boolText(ENABLE_WINDY) + ",";
   json += "\"windyLastOk\":" + boolText(windyLastOk) + ",";
   json += "\"windyLastHttpCode\":" + String(windyLastHttpCode) + ",";
-  json += "\"windyLastStatusLine\":\"" + windyLastStatusLine + "\",";
+  json += "\"windyLastStatusLine\":\"" + jsonEscape(windyLastStatusLine) + "\",";
+  json += "\"windyLastBody\":\"" + jsonEscape(windyLastBody) + "\",";
   json += "\"windyLastAttemptUtc\":\"" + fmtUnixAsUtc(windyLastAttemptTs) + "\",";
   json += "\"windyLastSuccessUtc\":\"" + fmtUnixAsUtc(windyLastSuccessTs) + "\",";
   json += "\"windySuccessCount\":\"" + String(windySuccessCount) + "\",";
@@ -594,6 +601,7 @@ String getHtmlPage() {
   html += ".card{background:#182028;border:1px solid #29333d;border-radius:14px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.25);}";
   html += ".label{font-size:13px;color:#8fa2b5;text-transform:uppercase;letter-spacing:.06em;}";
   html += ".value{font-size:24px;font-weight:700;margin-top:6px;word-break:break-word;}";
+  html += ".small{font-size:14px;font-weight:400;line-height:1.35;white-space:pre-wrap;}";
   html += ".ok{color:#7CFC8A;} .bad{color:#ff7f7f;} .mid{color:#ffd166;}";
   html += "pre{background:#0d1117;border:1px solid #29333d;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word;}";
   html += "</style></head><body>";
@@ -608,8 +616,9 @@ String getHtmlPage() {
   html += "<pre id='raw'>Ładowanie...</pre>";
   html += "<script>";
   html += "function val(v,u=''){return v===null?'--':String(v)+u;}";
-  html += "function statusClass(v){return v?'ok':'bad';}";
   html += "function card(title,value,cls){return `<div class='card'><div class='label'>${title}</div><div class='value ${cls||''}'>${value}</div></div>`;}";
+  html += "function bodyCard(title,value,cls){return `<div class='card'><div class='label'>${title}</div><div class='value small ${cls||''}'>${value||''}</div></div>`;}";
+  html += "function windyHttpClass(code){code=Number(code); if(code===200||code===409) return 'ok'; if(code===429) return 'mid'; if(code===400||code===401) return 'bad'; return '';}";
   html += "async function loadStatus(){";
   html += "let r=await fetch('/status'); let d=await r.json();";
   html += "let c='';";
@@ -619,18 +628,18 @@ String getHtmlPage() {
   html += "c+=card('Pressure', val(d.pressure,' hPa'));";
   html += "c+=card('PM2.5', val(d.pm25,' ug/m3'));";
   html += "c+=card('PM10', val(d.pm10,' ug/m3'));";
-  html += "c+=card('WiFi', d.wifiConnected?'OK':'OFF', statusClass(d.wifiConnected));";
-  html += "c+=card('APRS TCP', d.aprsConnected?'OK':'OFF', statusClass(d.aprsConnected));";
+  html += "c+=card('WiFi', d.wifiConnected?'OK':'OFF', d.wifiConnected?'ok':'bad');";
+  html += "c+=card('APRS TCP', d.aprsConnected?'OK':'OFF', d.aprsConnected?'ok':'bad');";
   html += "c+=card('APRS Login', d.aprsLoggedIn?'YES':'NO', d.aprsLoggedIn?'ok':'bad');";
-  html += "c+=card('NTP', d.timeSynced?'OK':'NO', statusClass(d.timeSynced));";
+  html += "c+=card('NTP', d.timeSynced?'OK':'NO', d.timeSynced?'ok':'bad');";
   html += "c+=card('Debug', d.debugEnabled?'ON':'OFF', d.debugEnabled?'mid':'');";
-  html += "c+=card('BME280', d.bmeOk?'OK':'ERR', statusClass(d.bmeOk));";
+  html += "c+=card('BME280', d.bmeOk?'OK':'ERR', d.bmeOk?'ok':'bad');";
   html += "c+=card('SDS Awake', d.sdsAwake?'YES':'NO', d.sdsAwake?'mid':'');";
   html += "c+=card('SDS Waiting', d.sdsWaitingForSample?'YES':'NO', d.sdsWaitingForSample?'mid':'');";
   html += "c+=card('SDS Fresh', d.sdsFreshData?'YES':'NO', d.sdsFreshData?'mid':'');";
   html += "c+=card('Windy last OK', d.windyLastOk?'YES':'NO', d.windyLastOk?'ok':'bad');";
-  html += "c+=card('Windy HTTP', d.windyLastHttpCode);";
-  html += "c+=card('Windy status', d.windyLastStatusLine);";
+  html += "c+=card('Windy HTTP', d.windyLastHttpCode, windyHttpClass(d.windyLastHttpCode));";
+  html += "c+=card('Windy status', d.windyLastStatusLine, windyHttpClass(d.windyLastHttpCode));";
   html += "c+=card('Windy last try', d.windyLastAttemptUtc);";
   html += "c+=card('Windy last success', d.windyLastSuccessUtc, d.windyLastSuccessUtc==='never'?'bad':'ok');";
   html += "c+=card('Windy OK count', d.windySuccessCount);";
@@ -643,6 +652,7 @@ String getHtmlPage() {
   html += "c+=card('Uptime', d.uptimeText);";
   html += "c+=card('UTC', d.utcNow);";
   html += "c+=card('Seq', d.telemSeq);";
+  html += "c+=bodyCard('Windy body', d.windyLastBody, windyHttpClass(d.windyLastHttpCode));";
   html += "document.getElementById('cards').innerHTML=c;";
   html += "document.getElementById('raw').textContent=JSON.stringify(d,null,2);";
   html += "}";
@@ -695,6 +705,9 @@ void printSensorBlock() {
   DBG_PRINT("Windy last OK: "); DBG_PRINTLN(windyLastOk ? "YES" : "NO");
   DBG_PRINT("Windy HTTP: "); DBG_PRINTLN(String(windyLastHttpCode));
   DBG_PRINT("Windy last: "); DBG_PRINTLN(windyLastStatusLine);
+  if (windyLastBody.length()) {
+    DBG_PRINT("Windy body: "); DBG_PRINTLN(windyLastBody);
+  }
   if (timeSynced) {
     DBG_PRINT("APRS UTC ts: "); DBG_PRINTLN(aprsZuluTimestamp());
   }
