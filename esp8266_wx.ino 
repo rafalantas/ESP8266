@@ -13,11 +13,11 @@
 
 const char* DEVICE_HOSTNAME = "sq4lol-wx";
 const char* MDNS_NAME       = "sq4lol-wx";
-const char* FW_VERSION      = "ESP8266WX 3.1-sensors-back";
+const char* FW_VERSION      = "ESP8266WX 3.2-sequential-sds";
 
 const char* APRS_HOST    = "poland.aprs2.net";
 const uint16_t APRS_PORT = 14580;
-const char* APRS_VERS    = "ESP8266WX 3.1";
+const char* APRS_VERS    = "ESP8266WX 3.2";
 const char* APRS_DEST    = "APRS";
 
 const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -38,16 +38,16 @@ const unsigned long SENSOR_PRINT_MS = 10000UL;
 const unsigned long SENSOR_CACHE_MS = 5000UL;
 
 const unsigned long SDS_CYCLE_MS    = 600000UL;   // 10 min
-const unsigned long SDS_WARMUP_MS   = 35000UL;
-const unsigned long SDS_SAMPLE_MS   = 5000UL;
+const unsigned long SDS_WARMUP_MS   = 35000UL;    // ~35 s
+const unsigned long SDS_SAMPLE_MS   = 5000UL;     // 5 s okno odczytu
 
-const unsigned long TELEMETRY_MS    = 600000UL;   // 10 min
-const unsigned long WEATHER_MS      = 660000UL;   // 11 min
-const unsigned long THINGSPEAK_MS   = 720000UL;   // 12 min
-const unsigned long WINDY_MS        = 780000UL;   // 13 min
 const unsigned long META_MS         = 21600000UL; // 6 h
 const unsigned long RS_MS           = 1800000UL;  // 30 min
+const unsigned long WEATHER_MS      = 660000UL;   // 11 min APRS WX
 const unsigned long WIFI_CHECK_MS   = 15000UL;
+
+const unsigned long TS_DELAY_AFTER_SAMPLE_MS    = 15000UL; // 15 s po SDS
+const unsigned long WINDY_DELAY_AFTER_SAMPLE_MS = 30000UL; // 30 s po SDS
 
 Adafruit_BME280 bme;
 SoftwareSerial sdsSerial(SDS_RX_PIN, SDS_TX_PIN);
@@ -72,17 +72,19 @@ bool debugEnabled = false;
 bool mdnsStarted = false;
 bool aprsLoggedIn = false;
 
+bool cycleAprsSent = false;
+bool cycleThingSpeakSent = false;
+bool cycleWindySent = false;
+unsigned long cycleSampleTime = 0;
+
 unsigned long sdsWakeTime = 0;
 unsigned long lastSdsCycle = 0;
 unsigned long lastSensorPrint = 0;
 unsigned long lastSensorCache = 0;
-unsigned long lastTelemetry   = 0;
 unsigned long lastWeather     = 0;
 unsigned long lastMeta        = 0;
 unsigned long lastRS          = 0;
 unsigned long lastWiFiCheck   = 0;
-unsigned long lastThingSpeak  = 0;
-unsigned long lastWindy       = 0;
 
 unsigned long lastAprsAttempt = 0;
 unsigned long lastAprsSuccess = 0;
@@ -453,7 +455,7 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   float baroInHg = pressHpa * 0.0295299831f;
 
   String url = "/api/v2/observation/update"
-               "?stationtype=ESP8266WX_3.1"
+               "?stationtype=ESP8266WX_3.2"
                "&ID=" + String(WINDY_STATION_ID) +
                "&PASSWORD=" + String(WINDY_STATION_PASSWORD) +
                "&dateutc=now"
@@ -511,6 +513,10 @@ String getSystemJson() {
   json += "\"pm25\":" + fmtFloatOrNull(pm25, 1) + ",";
   json += "\"pm10\":" + fmtFloatOrNull(pm10, 1) + ",";
 
+  json += "\"sdsAwake\":" + boolText(sdsAwake) + ",";
+  json += "\"sdsWaiting\":" + boolText(sdsWaitingForSample) + ",";
+  json += "\"sdsFreshData\":" + boolText(sdsFreshData) + ",";
+
   json += "\"aprsConnected\":" + boolText(aprsClient.connected()) + ",";
   json += "\"aprsLoggedIn\":" + boolText(aprsLoggedIn) + ",";
   json += "\"aprsLastOk\":" + boolText(aprsLastOk) + ",";
@@ -556,6 +562,9 @@ String getHtmlPage() {
   html += "c+=card('Cisnienie',d.pressure ?? '--','mid');";
   html += "c+=card('PM2.5',d.pm25 ?? '--','mid');";
   html += "c+=card('PM10',d.pm10 ?? '--','mid');";
+  html += "c+=card('SDS Awake',d.sdsAwake?'YES':'NO',d.sdsAwake?'mid':'ok');";
+  html += "c+=card('SDS Waiting',d.sdsWaiting?'YES':'NO',d.sdsWaiting?'mid':'ok');";
+  html += "c+=card('Fresh SDS',d.sdsFreshData?'YES':'NO',d.sdsFreshData?'ok':'mid');";
   html += "c+=card('APRS TCP',d.aprsConnected?'OK':'OFF',statusClass(d.aprsConnected));";
   html += "c+=card('APRS Login',d.aprsLoggedIn?'YES':'NO',d.aprsLoggedIn?'ok':'bad');";
   html += "c+=card('APRS status',d.aprsLastOk?'OK':'FAIL',d.aprsLastOk?'ok':'bad');";
@@ -602,11 +611,16 @@ void printSensorBlock() {
   DBG_PRINT("Press hPa: "); DBG_PRINTLN(lastPressHpa);
   DBG_PRINT("PM2.5    : "); DBG_PRINTLN(pm25);
   DBG_PRINT("PM10     : "); DBG_PRINTLN(pm10);
+  DBG_PRINT("SDS fresh: "); DBG_PRINTLN(sdsFreshData ? "YES" : "NO");
   DBG_PRINT("APRS OK  : "); DBG_PRINTLN(aprsLastOk ? "YES" : "NO");
   DBG_PRINT("TS OK    : "); DBG_PRINTLN(thingSpeakLastOk ? "YES" : "NO");
   DBG_PRINT("Windy OK : "); DBG_PRINTLN(windyLastOk ? "YES" : "NO");
-  DBG_PRINT("TS err   : "); DBG_PRINTLN(thingSpeakLastError);
-  DBG_PRINT("Windy err: "); DBG_PRINTLN(windyLastError);
+}
+
+void resetCycleSendFlags() {
+  cycleAprsSent = false;
+  cycleThingSpeakSent = false;
+  cycleWindySent = false;
 }
 
 void setup() {
@@ -639,12 +653,8 @@ void setup() {
   server.on("/debug", handleDebug);
   server.begin();
 
-  unsigned long now = millis();
-  lastSdsCycle   = now;
-  lastTelemetry  = now;
-  lastWeather    = now - 60000UL;
-  lastThingSpeak = now - 120000UL;
-  lastWindy      = now - 180000UL;
+  lastSdsCycle = millis();
+  resetCycleSendFlags();
 }
 
 void loop() {
@@ -671,6 +681,8 @@ void loop() {
   if (!sdsAwake && !sdsWaitingForSample &&
       (lastSdsCycle == 0 || millis() - lastSdsCycle >= SDS_CYCLE_MS)) {
     lastSdsCycle = millis();
+    resetCycleSendFlags();
+    sdsFreshData = false;
     sdsWake();
     sdsAwake = true;
     sdsWaitingForSample = true;
@@ -688,6 +700,7 @@ void loop() {
         pm25 = newPm25;
         pm10 = newPm10;
         sdsFreshData = true;
+        cycleSampleTime = millis();
         gotSample = true;
         break;
       }
@@ -698,7 +711,9 @@ void loop() {
     sdsAwake = false;
     sdsWaitingForSample = false;
 
-    if (!gotSample) DBG_PRINTLN("[SDS011] No valid sample after wake");
+    if (!gotSample) {
+      DBG_PRINTLN("[SDS011] No valid sample after wake");
+    }
   }
 
   if (millis() - lastSensorPrint >= SENSOR_PRINT_MS) {
@@ -715,47 +730,49 @@ void loop() {
       sendAprsLine(aprsBitsLine());
     }
 
-    if (millis() - lastTelemetry >= TELEMETRY_MS && sdsFreshData) {
-      lastTelemetry = millis();
-      int pm25i = isnan(pm25) ? 0 : (int)round(pm25);
-      int pm10i = isnan(pm10) ? 0 : (int)round(pm10);
-      sendAprsLine(aprsTelemetryLine(telemSeq, pm25i, pm10i));
-      telemSeq++;
-      if (telemSeq > 999) telemSeq = 1;
+    if (lastRS == 0 || millis() - lastRS >= RS_MS) {
+      lastRS = millis();
+      sendAprsLine(aprsRadiosondeLine());
     }
 
-    if (millis() - lastWeather >= WEATHER_MS) {
+    if (lastWeather == 0 || millis() - lastWeather >= WEATHER_MS) {
       lastWeather = millis();
       if (!isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) && timeSynced) {
         sendAprsLine(aprsWeatherLine(lastTempC, lastHum, lastPressHpa));
       }
     }
+  }
 
-    if (lastRS == 0 || millis() - lastRS >= RS_MS) {
-      lastRS = millis();
-      sendAprsLine(aprsRadiosondeLine());
+  if (sdsFreshData && WiFi.status() == WL_CONNECTED) {
+    if (!cycleAprsSent && aprsClient.connected()) {
+      int pm25i = isnan(pm25) ? 0 : (int)round(pm25);
+      int pm10i = isnan(pm10) ? 0 : (int)round(pm10);
+      sendAprsLine(aprsTelemetryLine(telemSeq, pm25i, pm10i));
+      telemSeq++;
+      if (telemSeq > 999) telemSeq = 1;
+      cycleAprsSent = true;
     }
-  }
 
-  if (WiFi.status() == WL_CONNECTED &&
-      ENABLE_THINGSPEAK &&
-      !isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) &&
-      !isnan(pm25) && !isnan(pm10) &&
-      millis() - lastThingSpeak >= THINGSPEAK_MS) {
-    thingSpeakLastOk = sendThingSpeakPrimary(lastTempC, lastHum, lastPressHpa, pm25, pm10);
-    lastThingSpeak = millis();
-  }
+    if (!cycleThingSpeakSent &&
+        ENABLE_THINGSPEAK &&
+        millis() - cycleSampleTime >= TS_DELAY_AFTER_SAMPLE_MS &&
+        !isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) &&
+        !isnan(pm25) && !isnan(pm10)) {
+      thingSpeakLastOk = sendThingSpeakPrimary(lastTempC, lastHum, lastPressHpa, pm25, pm10);
+      cycleThingSpeakSent = true;
+    }
 
-  if (WiFi.status() == WL_CONNECTED &&
-      ENABLE_WINDY &&
-      timeSynced &&
-      !isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa) &&
-      millis() - lastWindy >= WINDY_MS) {
-    sendWindyV2(lastTempC, lastHum, lastPressHpa);
-    lastWindy = millis();
-  }
+    if (!cycleWindySent &&
+        ENABLE_WINDY &&
+        millis() - cycleSampleTime >= WINDY_DELAY_AFTER_SAMPLE_MS &&
+        timeSynced &&
+        !isnan(lastTempC) && !isnan(lastHum) && !isnan(lastPressHpa)) {
+      sendWindyV2(lastTempC, lastHum, lastPressHpa);
+      cycleWindySent = true;
+    }
 
-  if (sdsFreshData && lastTelemetry != 0 && millis() - lastTelemetry < 10000UL) {
-    sdsFreshData = false;
+    if (cycleAprsSent && cycleThingSpeakSent && cycleWindySent) {
+      sdsFreshData = false;
+    }
   }
 }
