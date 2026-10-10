@@ -17,7 +17,7 @@
 
 const char* DEVICE_HOSTNAME = "sq4lol-wx";
 const char* MDNS_NAME       = "sq4lol-wx";
-const char* FW_VERSION      = "ESP8266WX 2.5-ts265521";
+const char* FW_VERSION      = "ESP8266WX 2.5-ts265521-windypass";
 
 // --- APRS public config ---
 const char* APRS_HOST    = "poland.aprs2.net";
@@ -52,6 +52,7 @@ const unsigned long RS_MS           = 1800000UL;
 const unsigned long WIFI_CHECK_MS   = 15000UL;
 const unsigned long THINGSPEAK_MS   = 600000UL;
 const unsigned long WINDY_MS        = 600000UL;
+const unsigned long WINDY_RETRY_MS  = 60000UL;
 
 // --- SDS011 ---
 const unsigned long SDS_CYCLE_MS    = 600000UL;
@@ -94,6 +95,15 @@ unsigned long lastRS          = 0;
 unsigned long lastWiFiCheck   = 0;
 unsigned long lastThingSpeak  = 0;
 unsigned long lastWindy       = 0;
+unsigned long lastWindyTry    = 0;
+
+bool windyLastOk = false;
+int windyLastHttpCode = 0;
+String windyLastStatusLine = "";
+unsigned long windySuccessCount = 0;
+unsigned long windyFailCount = 0;
+time_t windyLastAttemptTs = 0;
+time_t windyLastSuccessTs = 0;
 
 // =====================================================
 // DEBUG
@@ -143,6 +153,18 @@ bool validTemp(float t) {
 
 bool validHumidity(float h) {
   return !isnan(h) && h >= 0.0f && h <= 100.0f;
+}
+
+String fmtUnixAsUtc(time_t ts) {
+  if (ts <= 0) return "never";
+  struct tm tmUtc;
+  gmtime_r(&ts, &tmUtc);
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+           tmUtc.tm_year + 1900, tmUtc.tm_mon + 1, tmUtc.tm_mday,
+           tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
+  return String(buf);
 }
 
 void updateBmeCache() {
@@ -441,8 +463,15 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
 
+  windyLastAttemptTs = time(nullptr);
+  windyLastHttpCode = 0;
+  windyLastStatusLine = "connect-start";
+
   if (!client->connect(WINDY_HOST, 443)) {
     DBG_PRINTLN("[Windy v2] connect failed");
+    windyLastOk = false;
+    windyFailCount++;
+    windyLastStatusLine = "connect-failed";
     return false;
   }
 
@@ -451,6 +480,7 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
 
   String url = "/api/v2/observation/update"
                "?id=" + String(WINDY_STATION_ID) +
+               "&PASSWORD=" + String(WINDY_STATION_PASSWORD) +
                "&ts=" + String(ts) +
                "&temp=" + String(tempC, 1) +
                "&humidity=" + String((int)round(hum)) +
@@ -462,26 +492,49 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
 
   client->print(String("POST ") + url + " HTTP/1.1\r\n" +
                 "Host: " + WINDY_HOST + "\r\n" +
-                "Authorization: Bearer " + WINDY_STATION_PASSWORD + "\r\n" +
                 "Connection: close\r\n" +
                 "Content-Length: 0\r\n\r\n");
 
   unsigned long timeout = millis();
-  bool gotHttp200 = false;
+  bool firstLineSeen = false;
 
   while (client->connected() && millis() - timeout < 5000) {
     while (client->available()) {
       String line = client->readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+
       DBG_PRINTLN(line);
       timeout = millis();
-      if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
-        gotHttp200 = true;
+
+      if (!firstLineSeen && line.startsWith("HTTP/1.")) {
+        firstLineSeen = true;
+        windyLastStatusLine = line;
+
+        int p1 = line.indexOf(' ');
+        int p2 = line.indexOf(' ', p1 + 1);
+        if (p1 > 0 && p2 > p1) {
+          windyLastHttpCode = line.substring(p1 + 1, p2).toInt();
+        }
       }
     }
+    delay(1);
   }
 
   client->stop();
-  return gotHttp200;
+
+  bool ok = (windyLastHttpCode >= 200 && windyLastHttpCode < 300);
+  windyLastOk = ok;
+
+  if (ok) {
+    windyLastSuccessTs = windyLastAttemptTs;
+    windySuccessCount++;
+  } else {
+    windyFailCount++;
+    if (windyLastStatusLine.length() == 0) windyLastStatusLine = "no-http-status";
+  }
+
+  return ok;
 }
 
 // =====================================================
@@ -514,7 +567,15 @@ String getSystemJson() {
   json += "\"telemSeq\":\"" + String(telemSeq) + "\",";
   json += "\"heap\":\"" + String(ESP.getFreeHeap()) + "\",";
   json += "\"uptimeMs\":\"" + String(millis()) + "\",";
-  json += "\"uptimeText\":\"" + uptimeString() + "\"";
+  json += "\"uptimeText\":\"" + uptimeString() + "\",";
+  json += "\"windyEnabled\":" + boolText(ENABLE_WINDY) + ",";
+  json += "\"windyLastOk\":" + boolText(windyLastOk) + ",";
+  json += "\"windyLastHttpCode\":" + String(windyLastHttpCode) + ",";
+  json += "\"windyLastStatusLine\":\"" + windyLastStatusLine + "\",";
+  json += "\"windyLastAttemptUtc\":\"" + fmtUnixAsUtc(windyLastAttemptTs) + "\",";
+  json += "\"windyLastSuccessUtc\":\"" + fmtUnixAsUtc(windyLastSuccessTs) + "\",";
+  json += "\"windySuccessCount\":\"" + String(windySuccessCount) + "\",";
+  json += "\"windyFailCount\":\"" + String(windyFailCount) + "\"";
   json += "}";
   return json;
 }
@@ -567,6 +628,13 @@ String getHtmlPage() {
   html += "c+=card('SDS Awake', d.sdsAwake?'YES':'NO', d.sdsAwake?'mid':'');";
   html += "c+=card('SDS Waiting', d.sdsWaitingForSample?'YES':'NO', d.sdsWaitingForSample?'mid':'');";
   html += "c+=card('SDS Fresh', d.sdsFreshData?'YES':'NO', d.sdsFreshData?'mid':'');";
+  html += "c+=card('Windy last OK', d.windyLastOk?'YES':'NO', d.windyLastOk?'ok':'bad');";
+  html += "c+=card('Windy HTTP', d.windyLastHttpCode);";
+  html += "c+=card('Windy status', d.windyLastStatusLine);";
+  html += "c+=card('Windy last try', d.windyLastAttemptUtc);";
+  html += "c+=card('Windy last success', d.windyLastSuccessUtc, d.windyLastSuccessUtc==='never'?'bad':'ok');";
+  html += "c+=card('Windy OK count', d.windySuccessCount);";
+  html += "c+=card('Windy FAIL count', d.windyFailCount, Number(d.windyFailCount)>0?'bad':'');";
   html += "c+=card('RSSI', d.rssi+' dBm');";
   html += "c+=card('Heap', d.heap+' B');";
   html += "c+=card('IP', d.ip);";
@@ -624,6 +692,9 @@ void printSensorBlock() {
   DBG_PRINT("PM2.5    : "); DBG_PRINTLN(fmtFloatOrNull(pm25, 1));
   DBG_PRINT("PM10     : "); DBG_PRINTLN(fmtFloatOrNull(pm10, 1));
   DBG_PRINT("NTP synced: "); DBG_PRINTLN(timeSynced ? "YES" : "NO");
+  DBG_PRINT("Windy last OK: "); DBG_PRINTLN(windyLastOk ? "YES" : "NO");
+  DBG_PRINT("Windy HTTP: "); DBG_PRINTLN(String(windyLastHttpCode));
+  DBG_PRINT("Windy last: "); DBG_PRINTLN(windyLastStatusLine);
   if (timeSynced) {
     DBG_PRINT("APRS UTC ts: "); DBG_PRINTLN(aprsZuluTimestamp());
   }
@@ -789,9 +860,16 @@ void loop() {
       lastThingSpeak = millis();
     }
 
-    if (ENABLE_WINDY && timeSynced && millis() - lastWindy >= WINDY_MS) {
-      sendWindyV2(lastTempC, lastHum, lastPressHpa);
-      lastWindy = millis();
+    if (ENABLE_WINDY && timeSynced) {
+      unsigned long windyInterval = windyLastOk ? WINDY_MS : WINDY_RETRY_MS;
+
+      if (lastWindyTry == 0 || millis() - lastWindyTry >= windyInterval) {
+        lastWindyTry = millis();
+
+        if (sendWindyV2(lastTempC, lastHum, lastPressHpa)) {
+          lastWindy = millis();
+        }
+      }
     }
   }
 }
