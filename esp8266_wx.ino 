@@ -12,39 +12,29 @@
 #include <math.h>
 #include "secrets.h"
 
-// =====================================================
-// PUBLIC CONFIG
-// =====================================================
-
 const char* DEVICE_HOSTNAME = "sq4lol-wx";
 const char* MDNS_NAME       = "sq4lol-wx";
-const char* FW_VERSION      = "ESP8266WX 2.6-ts265521-windyhttpclient";
+const char* FW_VERSION      = "ESP8266WX 2.6-release-windy5m";
 
-// --- APRS public config ---
 const char* APRS_HOST    = "poland.aprs2.net";
 const uint16_t APRS_PORT = 14580;
 const char* APRS_VERS    = "ESP8266WX 2.6";
 const char* APRS_DEST    = "APRS";
 
-// --- NTP ---
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.nist.gov";
 
-// --- Public service config ---
 const bool ENABLE_THINGSPEAK = true;
 const char* THINGSPEAK_HOST = "api.thingspeak.com";
 
 const bool ENABLE_WINDY = true;
 const char* WINDY_HOST = "stations.windy.com";
 
-// --- Piny ---
 const uint8_t SDS_RX_PIN = D6;
 const uint8_t SDS_TX_PIN = D7;
 const uint8_t I2C_SDA_PIN = D2;
 const uint8_t I2C_SCL_PIN = D1;
 
-// --- Interwały ---
-const unsigned long SENSOR_PRINT_MS = 10000UL;
 const unsigned long SENSOR_CACHE_MS = 5000UL;
 const unsigned long TELEMETRY_MS    = 600000UL;
 const unsigned long WEATHER_MS      = 600000UL;
@@ -52,17 +42,13 @@ const unsigned long META_MS         = 21600000UL;
 const unsigned long RS_MS           = 1800000UL;
 const unsigned long WIFI_CHECK_MS   = 15000UL;
 const unsigned long THINGSPEAK_MS   = 600000UL;
-const unsigned long WINDY_MS        = 600000UL;
-const unsigned long WINDY_RETRY_MS  = 60000UL;
+const unsigned long WINDY_MS        = 300000UL;
+const unsigned long WINDY_RETRY_MS  = 300000UL;
 
-// --- SDS011 ---
 const unsigned long SDS_CYCLE_MS    = 600000UL;
 const unsigned long SDS_WARMUP_MS   = 35000UL;
 const unsigned long SDS_SAMPLE_MS   = 5000UL;
 
-// =====================================================
-// OBIEKTY I STAN
-// =====================================================
 Adafruit_BME280 bme;
 SoftwareSerial sdsSerial(SDS_RX_PIN, SDS_TX_PIN);
 WiFiClient aprsClient;
@@ -81,13 +67,11 @@ bool sdsAwake = false;
 bool sdsWaitingForSample = false;
 bool sdsFreshData = false;
 bool timeSynced = false;
-bool debugEnabled = false;
 bool mdnsStarted = false;
 bool aprsLoggedIn = false;
 
 unsigned long sdsWakeTime = 0;
 unsigned long lastSdsCycle = 0;
-unsigned long lastSensorPrint = 0;
 unsigned long lastSensorCache = 0;
 unsigned long lastTelemetry   = 0;
 unsigned long lastWeather     = 0;
@@ -107,16 +91,6 @@ unsigned long windyFailCount = 0;
 time_t windyLastAttemptTs = 0;
 time_t windyLastSuccessTs = 0;
 
-// =====================================================
-// DEBUG
-// =====================================================
-#define DBG_PRINT(x)     do { if (debugEnabled) Serial.print(x); } while (0)
-#define DBG_PRINTLN(x)   do { if (debugEnabled) Serial.println(x); } while (0)
-#define DBG_PRINTF(...)  do { if (debugEnabled) Serial.printf(__VA_ARGS__); } while (0)
-
-// =====================================================
-// HELPERS
-// =====================================================
 String boolText(bool v) {
   return v ? "true" : "false";
 }
@@ -208,12 +182,8 @@ void updateSensorsIfNeeded() {
   }
 }
 
-// =====================================================
-// TIME
-// =====================================================
 void initTime() {
   configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
-  DBG_PRINTLN("[NTP] configTime started");
 }
 
 bool updateTimeStatus() {
@@ -246,9 +216,6 @@ String isoUtcNow() {
   return String(buf);
 }
 
-// =====================================================
-// APRS
-// =====================================================
 String aprsLoginLine() {
   return String("user ") + APRS_CALL_WX + " pass " + APRS_PASS + " vers " + APRS_VERS;
 }
@@ -317,9 +284,6 @@ String aprsRadiosondeLine() {
   return String(line);
 }
 
-// =====================================================
-// SDS011
-// =====================================================
 void sdsSendCommand(const uint8_t *cmd, size_t len) {
   while (sdsSerial.available()) sdsSerial.read();
   for (size_t i = 0; i < len; i++) sdsSerial.write(cmd[i]);
@@ -332,7 +296,6 @@ void sdsSleep() {
     0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x05, 0xAB
   };
   sdsSendCommand(cmd, sizeof(cmd));
-  DBG_PRINTLN("[SDS011] SLEEP");
 }
 
 void sdsWake() {
@@ -341,7 +304,6 @@ void sdsWake() {
     0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x06, 0xAB
   };
   sdsSendCommand(cmd, sizeof(cmd));
-  DBG_PRINTLN("[SDS011] WAKE");
 }
 
 bool readSDS011(float &outPm25, float &outPm10) {
@@ -368,19 +330,11 @@ bool readSDS011(float &outPm25, float &outPm10) {
   return false;
 }
 
-// =====================================================
-// WIFI / MDNS / APRS
-// =====================================================
 void startMdnsIfNeeded() {
   if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
     if (MDNS.begin(MDNS_NAME)) {
       MDNS.addService("http", "tcp", 80);
       mdnsStarted = true;
-      DBG_PRINT("[mDNS] Started: http://");
-      DBG_PRINT(MDNS_NAME);
-      DBG_PRINTLN(".local");
-    } else {
-      DBG_PRINTLN("[mDNS] Start failed");
     }
   }
 }
@@ -422,9 +376,7 @@ void connectWiFi() {
 bool connectAprs() {
   if (aprsClient.connected()) return true;
 
-  DBG_PRINTF("[APRS] Connecting to %s:%u\n", APRS_HOST, APRS_PORT);
   if (!aprsClient.connect(APRS_HOST, APRS_PORT)) {
-    DBG_PRINTLN("[APRS] TCP connect failed");
     aprsLoggedIn = false;
     return false;
   }
@@ -433,29 +385,19 @@ bool connectAprs() {
   aprsClient.print(login);
   aprsClient.print("\r\n");
   aprsLoggedIn = true;
-
-  DBG_PRINT("[APRS] LOGIN >> ");
-  DBG_PRINTLN(login);
   return true;
 }
 
 void sendAprsLine(const String &line) {
-  DBG_PRINT("[APRS] TX >> ");
-  DBG_PRINTLN(line);
-
   if (aprsClient.connected()) {
     aprsClient.print(line);
     aprsClient.print("\r\n");
   }
 }
 
-// =====================================================
-// CLOUD
-// =====================================================
 bool sendThingSpeak265521(float tempC, float hum, float pressHpa, float vpm25, float vpm10) {
   WiFiClient client;
   if (!client.connect(THINGSPEAK_HOST, 80)) {
-    DBG_PRINTLN("[ThingSpeak 265521] connect failed");
     return false;
   }
 
@@ -465,9 +407,6 @@ bool sendThingSpeak265521(float tempC, float hum, float pressHpa, float vpm25, f
                "&field3=" + String(tempC, 1) +
                "&field4=" + String(hum, 1) +
                "&field5=" + String(pressHpa, 1);
-
-  DBG_PRINT("[ThingSpeak 265521] URL: ");
-  DBG_PRINTLN(url);
 
   client.print(String("GET ") + url + " HTTP/1.1\r\nHost: " + THINGSPEAK_HOST + "\r\nConnection: close\r\n\r\n");
   client.stop();
@@ -496,15 +435,11 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
                "&pressure=" + String(pressurePa) +
                "&softwaretype=ESP8266WX_2.6";
 
-  DBG_PRINT("[Windy v2] URL: ");
-  DBG_PRINTLN(url);
-
   HTTPClient https;
   https.setTimeout(8000);
   https.setReuse(false);
 
   if (!https.begin(*client, url)) {
-    DBG_PRINTLN("[Windy v2] HTTP begin failed");
     windyLastOk = false;
     windyFailCount++;
     windyLastStatusLine = "http-begin-failed";
@@ -517,15 +452,8 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   if (httpCode > 0) {
     windyLastStatusLine = String("HTTP ") + String(httpCode);
     windyLastBody = https.getString();
-    DBG_PRINTF("[Windy v2] HTTP code: %d\n", httpCode);
-    if (windyLastBody.length()) {
-      DBG_PRINT("[Windy v2] BODY: ");
-      DBG_PRINTLN(windyLastBody);
-    }
   } else {
     windyLastStatusLine = String("HTTPClient error: ") + https.errorToString(httpCode);
-    DBG_PRINT("[Windy v2] ");
-    DBG_PRINTLN(windyLastStatusLine);
   }
 
   https.end();
@@ -543,9 +471,6 @@ bool sendWindyV2(float tempC, float hum, float pressHpa) {
   return ok;
 }
 
-// =====================================================
-// WWW
-// =====================================================
 String getSystemJson() {
   String json = "{";
   json += "\"fwVersion\":\"" + String(FW_VERSION) + "\",";
@@ -560,7 +485,6 @@ String getSystemJson() {
   json += "\"aprsLoggedIn\":" + boolText(aprsLoggedIn) + ",";
   json += "\"timeSynced\":" + boolText(timeSynced) + ",";
   json += "\"utcNow\":\"" + isoUtcNow() + "\",";
-  json += "\"debugEnabled\":" + boolText(debugEnabled) + ",";
   json += "\"bmeOk\":" + boolText(bmeOk) + ",";
   json += "\"sdsAwake\":" + boolText(sdsAwake) + ",";
   json += "\"sdsWaitingForSample\":" + boolText(sdsWaitingForSample) + ",";
@@ -606,9 +530,8 @@ String getHtmlPage() {
   html += "pre{background:#0d1117;border:1px solid #29333d;border-radius:14px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word;}";
   html += "</style></head><body>";
   html += "<h1>ESP8266 Weather Station</h1>";
-  html += "<p>Panel lokalny: czujniki, stan systemu, debug przez WWW, hostname i mDNS.</p>";
+  html += "<p>Panel lokalny: czujniki i stan wysyłki danych.</p>";
   html += "<div class='top'>";
-  html += "<button onclick='toggleDebug()'>Przełącz debug</button>";
   html += "<button onclick='loadStatus()'>Odśwież teraz</button>";
   html += "</div>";
   html += "<div class='grid' id='cards'></div>";
@@ -618,7 +541,6 @@ String getHtmlPage() {
   html += "function val(v,u=''){return v===null?'--':String(v)+u;}";
   html += "function card(title,value,cls){return `<div class='card'><div class='label'>${title}</div><div class='value ${cls||''}'>${value}</div></div>`;}";
   html += "function bodyCard(title,value,cls){return `<div class='card'><div class='label'>${title}</div><div class='value small ${cls||''}'>${value||''}</div></div>`;}";
-  html += "function windyHttpClass(code){code=Number(code); if(code===200||code===409) return 'ok'; if(code===429) return 'mid'; if(code===400||code===401) return 'bad'; return '';}";
   html += "async function loadStatus(){";
   html += "let r=await fetch('/status'); let d=await r.json();";
   html += "let c='';";
@@ -632,18 +554,18 @@ String getHtmlPage() {
   html += "c+=card('APRS TCP', d.aprsConnected?'OK':'OFF', d.aprsConnected?'ok':'bad');";
   html += "c+=card('APRS Login', d.aprsLoggedIn?'YES':'NO', d.aprsLoggedIn?'ok':'bad');";
   html += "c+=card('NTP', d.timeSynced?'OK':'NO', d.timeSynced?'ok':'bad');";
-  html += "c+=card('Debug', d.debugEnabled?'ON':'OFF', d.debugEnabled?'mid':'');";
   html += "c+=card('BME280', d.bmeOk?'OK':'ERR', d.bmeOk?'ok':'bad');";
   html += "c+=card('SDS Awake', d.sdsAwake?'YES':'NO', d.sdsAwake?'mid':'');";
   html += "c+=card('SDS Waiting', d.sdsWaitingForSample?'YES':'NO', d.sdsWaitingForSample?'mid':'');";
   html += "c+=card('SDS Fresh', d.sdsFreshData?'YES':'NO', d.sdsFreshData?'mid':'');";
   html += "c+=card('Windy last OK', d.windyLastOk?'YES':'NO', d.windyLastOk?'ok':'bad');";
-  html += "c+=card('Windy HTTP', d.windyLastHttpCode, windyHttpClass(d.windyLastHttpCode));";
-  html += "c+=card('Windy status', d.windyLastStatusLine, windyHttpClass(d.windyLastHttpCode));";
+  html += "c+=card('Windy HTTP', d.windyLastHttpCode);";
+  html += "c+=card('Windy status', d.windyLastStatusLine);";
   html += "c+=card('Windy last try', d.windyLastAttemptUtc);";
   html += "c+=card('Windy last success', d.windyLastSuccessUtc, d.windyLastSuccessUtc==='never'?'bad':'ok');";
   html += "c+=card('Windy OK count', d.windySuccessCount);";
   html += "c+=card('Windy FAIL count', d.windyFailCount, Number(d.windyFailCount)>0?'bad':'');";
+  html += "c+=bodyCard('Windy body', d.windyLastBody, d.windyLastHttpCode===200||d.windyLastHttpCode===409?'ok':'');";
   html += "c+=card('RSSI', d.rssi+' dBm');";
   html += "c+=card('Heap', d.heap+' B');";
   html += "c+=card('IP', d.ip);";
@@ -652,15 +574,8 @@ String getHtmlPage() {
   html += "c+=card('Uptime', d.uptimeText);";
   html += "c+=card('UTC', d.utcNow);";
   html += "c+=card('Seq', d.telemSeq);";
-  html += "c+=bodyCard('Windy body', d.windyLastBody, windyHttpClass(d.windyLastHttpCode));";
   html += "document.getElementById('cards').innerHTML=c;";
   html += "document.getElementById('raw').textContent=JSON.stringify(d,null,2);";
-  html += "}";
-  html += "async function toggleDebug(){";
-  html += "let r=await fetch('/status'); let d=await r.json();";
-  html += "let newValue = d.debugEnabled ? 0 : 1;";
-  html += "await fetch('/debug?set='+newValue);";
-  html += "await loadStatus();";
   html += "}";
   html += "setInterval(loadStatus,3000); loadStatus();";
   html += "</script></body></html>";
@@ -677,45 +592,6 @@ void handleStatus() {
   server.send(200, "application/json", getSystemJson());
 }
 
-void handleDebug() {
-  if (server.hasArg("set")) {
-    String v = server.arg("set");
-    debugEnabled = (v == "1" || v == "true" || v == "on");
-  }
-
-  String json = "{";
-  json += "\"debugEnabled\":";
-  json += (debugEnabled ? "true" : "false");
-  json += "}";
-  server.send(200, "application/json", json);
-}
-
-// =====================================================
-// SERIAL DEBUG
-// =====================================================
-void printSensorBlock() {
-  DBG_PRINTLN("");
-  DBG_PRINTLN("=== SENSOR DATA ===");
-  DBG_PRINT("Temp C   : "); DBG_PRINTLN(fmtFloatOrNull(lastTempC, 1));
-  DBG_PRINT("Hum %    : "); DBG_PRINTLN(fmtFloatOrNull(lastHum, 1));
-  DBG_PRINT("Press hPa: "); DBG_PRINTLN(fmtFloatOrNull(lastPressHpa, 1));
-  DBG_PRINT("PM2.5    : "); DBG_PRINTLN(fmtFloatOrNull(pm25, 1));
-  DBG_PRINT("PM10     : "); DBG_PRINTLN(fmtFloatOrNull(pm10, 1));
-  DBG_PRINT("NTP synced: "); DBG_PRINTLN(timeSynced ? "YES" : "NO");
-  DBG_PRINT("Windy last OK: "); DBG_PRINTLN(windyLastOk ? "YES" : "NO");
-  DBG_PRINT("Windy HTTP: "); DBG_PRINTLN(String(windyLastHttpCode));
-  DBG_PRINT("Windy last: "); DBG_PRINTLN(windyLastStatusLine);
-  if (windyLastBody.length()) {
-    DBG_PRINT("Windy body: "); DBG_PRINTLN(windyLastBody);
-  }
-  if (timeSynced) {
-    DBG_PRINT("APRS UTC ts: "); DBG_PRINTLN(aprsZuluTimestamp());
-  }
-}
-
-// =====================================================
-// SETUP
-// =====================================================
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -737,7 +613,6 @@ void setup() {
 
   Serial.print("[HOSTNAME] ");
   Serial.println(DEVICE_HOSTNAME);
-
   Serial.print("[BME280] ");
   Serial.println(bmeOk ? "OK" : "NOT FOUND");
   Serial.println("[SDS011] Serial started at 9600 baud");
@@ -750,7 +625,6 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
-  server.on("/debug", handleDebug);
   server.begin();
 
   Serial.println("[HTTP] Web server started");
@@ -761,9 +635,6 @@ void setup() {
   Serial.println(".local");
 }
 
-// =====================================================
-// LOOP
-// =====================================================
 void loop() {
   server.handleClient();
 
@@ -793,7 +664,6 @@ void loop() {
     sdsAwake = true;
     sdsWaitingForSample = true;
     sdsWakeTime = millis();
-    DBG_PRINTLN("[SDS011] Warmup started");
   }
 
   if (sdsAwake && sdsWaitingForSample && millis() - sdsWakeTime >= SDS_WARMUP_MS) {
@@ -816,19 +686,8 @@ void loop() {
     sdsAwake = false;
     sdsWaitingForSample = false;
 
-    if (gotSample) {
-      DBG_PRINT("[SDS011] Sample OK PM2.5=");
-      DBG_PRINT(String(pm25, 1));
-      DBG_PRINT(" PM10=");
-      DBG_PRINTLN(String(pm10, 1));
-    } else {
-      DBG_PRINTLN("[SDS011] No valid sample after wake");
+    if (!gotSample) {
     }
-  }
-
-  if (millis() - lastSensorPrint >= SENSOR_PRINT_MS) {
-    lastSensorPrint = millis();
-    printSensorBlock();
   }
 
   if (WiFi.status() == WL_CONNECTED && aprsClient.connected()) {
